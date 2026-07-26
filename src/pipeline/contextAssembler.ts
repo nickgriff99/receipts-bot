@@ -2,7 +2,7 @@ import type { LLMRequest, MemoryContextSlice, PersonaConfig } from "../llm/types
 import type { TranscriptSegment } from "../stt/types";
 import type { MemoryStore } from "../memory/types";
 import type { TurnCandidate } from "./types";
-import { CONTEXT_WINDOW_UTTERANCES } from "../config/constants";
+import { BOT_SPEAKER_ID, CONTEXT_WINDOW_UTTERANCES } from "../config/constants";
 
 /**
  * Builds the LLMRequest the response-generation call actually sees:
@@ -20,7 +20,7 @@ export class ContextAssembler {
   async assemble(candidate: TurnCandidate, persona: PersonaConfig, triggerReason: string, fullHistory: TranscriptSegment[]): Promise<LLMRequest> {
     const recentTranscript = fullHistory.slice(-CONTEXT_WINDOW_UTTERANCES);
 
-    const speakerIds = Array.from(new Set(recentTranscript.map((s) => s.userId)));
+    const speakerIds = Array.from(new Set(recentTranscript.map((s) => s.userId))).filter((id) => id !== BOT_SPEAKER_ID);
     const profiles = await Promise.all(speakerIds.map((userId) => this.memory.getProfile(candidate.guildId, userId)));
     const memoryContext: MemoryContextSlice[] = profiles
       .map((profile) => {

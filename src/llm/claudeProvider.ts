@@ -48,6 +48,9 @@ export class ClaudeHaikuProvider implements LLMProvider {
       "reactions, questions, and commentary. Say yes for almost anything: a joke, a reaction, an observation, a follow-up",
       "question, or just riffing on whatever was said. Only say no in the rare case where jumping in would clearly talk",
       "over someone who is still mid-sentence, or would step on a genuinely serious or sensitive moment.",
+      `IMPORTANT: the bot's own recent lines appear in the transcript labeled "${input.persona.name}:". Say NO if the`,
+      "bot would just be repeating a point it already made or beating a topic it has already reacted to — in that case",
+      "let the conversation move on and wait for something new. Prefer chiming in on the newest thing being said.",
       'Reply with ONLY compact JSON: {"respond": boolean, "reason": "one short phrase"}. No other text.',
     ].join(" ");
 
@@ -91,6 +94,10 @@ export class ClaudeHaikuProvider implements LLMProvider {
 
     const system = [
       request.persona.systemPrompt,
+      `Your own recent lines appear in the transcript labeled "${request.persona.name}:". Do NOT repeat points`,
+      "you already made or rephrase a reaction you already gave — if you've already addressed the current topic,",
+      "either add a genuinely new angle or reply with empty text. Track where the conversation is RIGHT NOW and",
+      "respond to the latest thing being discussed, not something already handled a few lines ago.",
       `Reply with ONLY compact JSON: {"text": "your spoken reply", "tone": "one word, optional"}.`,
       `Keep "text" to at most ${request.persona.maxResponseSentences} sentences.`,
       "If there is truly nothing worth saying, reply with {\"text\": \"\"}.",

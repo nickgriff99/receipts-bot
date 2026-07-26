@@ -13,6 +13,15 @@ export const FALLBACK_AUTO_JOIN_ON_USER_ENTRY = false;
 /** How many recent transcript segments the context assembler pulls into an LLM request. */
 export const CONTEXT_WINDOW_UTTERANCES = 15;
 
+/**
+ * Sentinel userId used for the bot's OWN replies when they are threaded back
+ * into the in-memory transcript history. This lets the ambient cheap-gate and
+ * response generator see what the bot already said (labeled with its persona
+ * name), so it stops repeating itself and can tell the conversation has moved
+ * on. Not a real user — context assembly skips profile lookups for this id.
+ */
+export const BOT_SPEAKER_ID = "__bot__";
+
 /** Max sentences the persona is asked to keep responses to, absent an explicit "say more" ask. */
 export const DEFAULT_MAX_RESPONSE_SENTENCES = 3;
 

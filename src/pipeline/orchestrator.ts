@@ -8,7 +8,7 @@ import type { TriggerType, TurnCandidate } from "./types";
 import { isExplicitTrigger } from "./types";
 import { TurnTakingEngine } from "./turnTaking";
 import { ContextAssembler } from "./contextAssembler";
-import { CONTEXT_WINDOW_UTTERANCES, LATENCY_WARN_THRESHOLD_MS } from "../config/constants";
+import { BOT_SPEAKER_ID, CONTEXT_WINDOW_UTTERANCES, LATENCY_WARN_THRESHOLD_MS } from "../config/constants";
 import { logger } from "../shared/logger";
 
 const log = logger.child("pipeline:orchestrator");
@@ -230,6 +230,11 @@ export class PipelineOrchestrator {
       return;
     }
 
+    // Thread the bot's own reply back into transcript history so later turns
+    // (ambient cheap-gate + generation) can see what it already said, avoid
+    // repeating itself, and notice when the conversation has moved on.
+    this.appendBotReply(segment, response.text);
+
     const speechEndAt = segment.endedAt;
     const priority: PlaybackPriority = isExplicitTrigger(triggerType) ? "explicit" : "ambient";
 
@@ -296,6 +301,30 @@ export class PipelineOrchestrator {
         await this.deps.memory.upsertProfile({ ...profile, sentimentNotes: extraction.sentimentNotes, updatedAt: Date.now() });
       }
     }
+  }
+
+  /**
+   * Record the bot's own spoken reply into the guild transcript history as a
+   * synthetic segment attributed to the persona name. `formatTranscript`
+   * renders it as `<persona name>: <reply>` in the window the cheap-gate and
+   * generator see next turn, giving the bot awareness of what it already said.
+   * Uses the BOT_SPEAKER_ID sentinel so context assembly skips a profile
+   * lookup for it (see contextAssembler).
+   */
+  private appendBotReply(trigger: TranscriptSegment, text: string): void {
+    const now = Date.now();
+    this.appendHistory({
+      id: `bot-${now}-${Math.random().toString(36).slice(2, 8)}`,
+      guildId: trigger.guildId,
+      channelId: trigger.channelId,
+      userId: BOT_SPEAKER_ID,
+      displayName: this.deps.persona.name,
+      text,
+      isFinal: true,
+      confidence: 1,
+      startedAt: now,
+      endedAt: now,
+    });
   }
 
   private appendHistory(segment: TranscriptSegment): void {
