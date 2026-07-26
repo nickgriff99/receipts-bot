@@ -1,0 +1,25 @@
+# VPS-only CPU cap override — deliberately NOT named
+# `docker-compose.override.yml`. That exact filename auto-merges into
+# every plain `docker compose up` call in this directory, on ANY
+# machine, including the owner's Windows PC. This file only applies
+# when explicitly passed with `-f` (see DEPLOY.md §7/§10), so the PC
+# keeps its current caps (bot 1.5 cpu / postgres 1.0 cpu, from
+# docker-compose.yml) untouched, and only the Hetzner CX22 gets the
+# lower caps below. Don't rename this file to the auto-loading name —
+# that would silently throttle the PC too.
+#
+# Why these numbers: CX22 has 2 real vCPUs. The base file's bot 1.5 +
+# postgres 1.0 = 2.5 cpu would let compose schedule more CPU than the
+# box actually has, leaving nothing for the OS/Docker daemon under
+# simultaneous peak load. Capped to bot 1.0 + postgres 0.5 = 1.5 total,
+# leaving 0.5 vCPU (25%) headroom — there's no real production load
+# data yet for this bot (see ARCHITECTURE.md), so this errs toward
+# headroom rather than squeezing every cycle out of a 2-vCPU box.
+# mem_limit is intentionally left untouched here: 512m + 1g = 1.5g
+# total already fits comfortably inside the CX22's 4GB, no change
+# needed.
+services:
+  bot:
+    cpus: 1.0
+  postgres:
+    cpus: 0.5

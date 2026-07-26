@@ -173,10 +173,24 @@ start, same as it already does on your PC. No edit needed.
 
 ## 7. Bring it up
 
+The CX22 has 2 real vCPUs — the base `docker-compose.yml` caps (bot 1.5
+cpu + postgres 1.0 cpu = 2.5) are sized for your PC and would over-commit
+this box. A second file, `docker-compose.prod.yml`, layers on lower VPS
+caps (bot 1.0 + postgres 0.5, leaving headroom for the OS). Bring it up
+**with both files, on the VPS only**:
+
 ```bash
 cd /home/deploy/receipts-bot
-docker compose up -d --build
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 ```
+
+Why not just name it `docker-compose.override.yml`? That exact filename
+auto-merges into *every* plain `docker compose up`, on *any* machine, in
+this same directory — including your PC. If this file were named that,
+the next `docker compose up -d --build` you run locally would silently
+inherit the VPS's lower CPU caps too. Naming it `docker-compose.prod.yml`
+and requiring the explicit `-f` flag keeps the two machines' caps
+independent — don't rename it later without keeping that in mind.
 
 Verify:
 
@@ -237,8 +251,18 @@ gunzip -c backups/receipts_bot_<STAMP>.sql.gz | docker compose exec -T postgres 
 ```
 
 Not covered here (deliberately, for a hobby box): offsite/off-VPS backup
-copies. If the disk dies, the backups die with it — fine for the current
-risk tolerance, worth revisiting if that changes.
+copies of the cron dump itself. If the disk dies, the `.sql.gz` files die
+with it — that's what the Hetzner snapshot below covers instead.
+
+**Also enable Hetzner Cloud snapshots** (console → your server →
+**Snapshots**, roughly 20% of the server's monthly cost) as a full-disk
+safety net alongside the cron dump above — additive, not a replacement.
+The cron dump lives on the same disk as everything else, so a deleted
+VPS or a failed disk takes it down too; a Hetzner snapshot is stored
+Hetzner-side, independent of this disk, and survives that. Different
+failure modes: the dump gives you a granular, scriptable restore of just
+the DB (§9 above); the snapshot gives you the whole box back (OS,
+Docker, repo, everything) if the VPS itself is gone.
 
 ## 10. Deploying updates later
 
@@ -248,9 +272,13 @@ Once this initial setup is done, shipping a code change is:
 ssh deploy@<VPS_IP>
 cd /home/deploy/receipts-bot
 git pull
-docker compose up -d --build
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 docker compose logs bot --tail 30   # confirm clean restart
 ```
+
+Keep using the two-file `-f` form on the VPS every time — dropping back
+to plain `docker compose up -d --build` here would silently re-apply the
+PC-sized caps (bot 1.5 / postgres 1.0 cpu) to the CX22's 2 vCPUs.
 
 `.env` doesn't move through git, so it's untouched by `git pull` — if a
 future change adds/renames env vars, `scp` the updated `.env` over again
@@ -261,7 +289,7 @@ future change adds/renames env vars, `scp` the updated `.env` over again
 ```bash
 git log --oneline -5          # find the last-known-good commit
 git checkout <good-commit>
-docker compose up -d --build
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 ```
 
 Postgres state isn't touched by a code rollback (same named volume,
