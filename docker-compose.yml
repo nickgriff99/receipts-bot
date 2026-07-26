@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: receipts_bot
+      POSTGRES_PASSWORD: receipts_bot
+      POSTGRES_DB: receipts_bot
+    volumes:
+      # persist user_profiles/guild_settings/conversation_log/usage_log
+      # across container restarts/rebuilds.
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U receipts_bot -d receipts_bot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    # Preventive hardening: cap resource use so this container can never
+    # starve the host, regardless of cause. Small single-tenant DB
+    # (user_profiles/guild_settings/conversation_log/usage_log) — 512m/1
+    # CPU is generous headroom over normal footprint.
+    mem_limit: 512m
+    cpus: 1.0
+
+  bot:
+    build: .
+    env_file:
+      - .env
+    environment:
+      # Overrides whatever DATABASE_URL is set to in .env (if any) so the
+      # bot always talks to the compose-managed postgres service by its
+      # service name, not localhost — .env's DATABASE_URL is only for the
+      # `npm run dev` (non-Docker) path.
+      DATABASE_URL: postgres://receipts_bot:receipts_bot@postgres:5432/receipts_bot
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    # Preventive hardening: cap resource use so this container can never
+    # starve the host, regardless of cause. Node.js bot process (discord.js
+    # + up to ~10 concurrent per-user Opus decode/STT/TTS streams) — 1g/1.5
+    # CPU covers normal peak with headroom.
+    mem_limit: 1g
+    cpus: 1.5
+
+volumes:
+  postgres-data:
