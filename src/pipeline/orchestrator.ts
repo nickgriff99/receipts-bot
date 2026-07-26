@@ -13,6 +13,35 @@ import { logger } from "../shared/logger";
 
 const log = logger.child("pipeline:orchestrator");
 
+/**
+ * Per-guild turn queue state (concurrency fix — bugs/nazgul round).
+ *
+ * `handleSegment` used to be called fire-and-forget (bootstrap.ts) with no
+ * serialization at all: every final transcript segment from any speaker
+ * spawned a fresh concurrent run of the expensive tail (turn-taking decide
+ * -> Claude generateResponse -> TTS synth -> playback -> Claude
+ * extractMemoryFacts). With 2+ people talking, segments arrive faster than
+ * one turn drains, so in-flight turns piled up unbounded on the single
+ * Node event loop -> latency climbed turn over turn (3s -> 59s observed),
+ * Discord interaction acks missed their ~3s window, Deepgram sockets
+ * dropped from starved keepalives.
+ *
+ * Fix: at most one turn's expensive tail in flight per guild. A segment
+ * that arrives while a turn is running for that guild does not spawn a
+ * concurrent run and is not queued unboundedly either — it replaces
+ * whatever was previously pending (bounded depth 1). The conversation has
+ * moved on by the time a stale pending turn would run, so processing it
+ * would be wasted latency/cost for a turn no longer relevant — better to
+ * only ever run the most recent segment next. Cheap bookkeeping (history
+ * append, conversation log, STT usage log) still happens synchronously for
+ * every segment in `handleSegment` itself, before enqueueing — only the
+ * expensive decide/generate/speak tail is serialized+deduped.
+ */
+interface GuildTurnQueue {
+  running: boolean;
+  pending: { segment: TranscriptSegment; triggerType: TriggerType } | null;
+}
+
 export interface OrchestratorDeps {
   llm: LLMProvider;
   tts: TTSProvider;
@@ -45,6 +74,7 @@ export class PipelineOrchestrator {
   private readonly turnTaking: TurnTakingEngine;
   private readonly contextAssembler: ContextAssembler;
   private readonly historyByGuild = new Map<string, TranscriptSegment[]>();
+  private readonly turnQueueByGuild = new Map<string, GuildTurnQueue>();
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.turnTaking = new TurnTakingEngine(deps.llm, deps.rateLimiter, deps.memory);
@@ -94,6 +124,71 @@ export class PipelineOrchestrator {
       });
     }
 
+    // Expensive tail (turn-taking decision -> Claude -> TTS -> playback ->
+    // memory extraction) is serialized per guild — see GuildTurnQueue doc
+    // comment above. Not awaited here: callers (bootstrap.ts) only need the
+    // cheap bookkeeping above to have happened before this method resolves,
+    // same as before this fix (they never relied on `handleSegment`'s
+    // promise resolving only once the bot finished speaking).
+    this.enqueueTurn(segment, triggerType);
+  }
+
+  /**
+   * Runs the given segment's turn immediately if none is in flight for its
+   * guild, else stashes it as the (sole) pending turn for that guild,
+   * dropping/replacing whatever was pending before.
+   */
+  private enqueueTurn(segment: TranscriptSegment, triggerType: TriggerType): void {
+    const guildId = segment.guildId;
+    let queue = this.turnQueueByGuild.get(guildId);
+    if (!queue) {
+      queue = { running: false, pending: null };
+      this.turnQueueByGuild.set(guildId, queue);
+    }
+
+    if (queue.running) {
+      if (queue.pending) {
+        log.debug("dropping stale queued turn — superseded by newer segment", { guildId });
+      }
+      queue.pending = { segment, triggerType };
+      return;
+    }
+
+    queue.running = true;
+    void this.drainTurnQueue(guildId, queue, segment, triggerType);
+  }
+
+  /**
+   * Runs turns for a guild one at a time until its pending slot is empty.
+   * Errors from an individual turn are logged and do not stop the drain
+   * (mirrors the `.catch()` logging bootstrap.ts used to do around the old
+   * fire-and-forget `handleSegment` call).
+   */
+  private async drainTurnQueue(
+    guildId: string,
+    queue: GuildTurnQueue,
+    firstSegment: TranscriptSegment,
+    firstTriggerType: TriggerType,
+  ): Promise<void> {
+    let segment = firstSegment;
+    let triggerType = firstTriggerType;
+    for (;;) {
+      try {
+        await this.runTurn(segment, triggerType);
+      } catch (err) {
+        log.error("turn processing failed", {
+          guildId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      if (!queue.pending) break;
+      ({ segment, triggerType } = queue.pending);
+      queue.pending = null;
+    }
+    queue.running = false;
+  }
+
+  private async runTurn(segment: TranscriptSegment, triggerType: TriggerType): Promise<void> {
     const candidate: TurnCandidate = {
       guildId: segment.guildId,
       channelId: segment.channelId,
