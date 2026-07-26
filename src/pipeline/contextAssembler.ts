@@ -17,7 +17,14 @@ import { BOT_SPEAKER_ID, CONTEXT_WINDOW_UTTERANCES } from "../config/constants";
 export class ContextAssembler {
   constructor(private readonly memory: MemoryStore) {}
 
-  async assemble(candidate: TurnCandidate, persona: PersonaConfig, triggerReason: string, fullHistory: TranscriptSegment[]): Promise<LLMRequest> {
+  async assemble(
+    candidate: TurnCandidate,
+    persona: PersonaConfig,
+    triggerReason: string,
+    fullHistory: TranscriptSegment[],
+    /** Tone-variety mechanism (Merry) — oldest first, capped by orchestrator.ts's MAX_RECENT_TONES_PER_GUILD. Threaded straight onto the request, no transform needed here. */
+    recentTones: string[] = [],
+  ): Promise<LLMRequest> {
     const recentTranscript = fullHistory.slice(-CONTEXT_WINDOW_UTTERANCES);
 
     const speakerIds = Array.from(new Set(recentTranscript.map((s) => s.userId))).filter((id) => id !== BOT_SPEAKER_ID);
@@ -44,6 +51,7 @@ export class ContextAssembler {
       recentTranscript,
       memoryContext,
       triggerReason,
+      recentTones,
     };
   }
 }

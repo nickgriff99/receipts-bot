@@ -15,6 +15,7 @@ import {
   type Message,
   type TextChannel,
   type VoiceBasedChannel,
+  type VoiceState,
 } from "discord.js";
 import type { VoiceConnection } from "@discordjs/voice";
 import type { AppConfig } from "../config/types";
@@ -40,6 +41,22 @@ const log = logger.child("discord:bootstrap");
 /** Stable customId for the consent-notice accept button — no guild/user encoding needed, `interaction.guildId`/`interaction.user.id` come off the button interaction itself. */
 const CONSENT_ACCEPT_BUTTON_ID = "consent_accept";
 
+/**
+ * How long after an auto-join-triggering user's own entry event we skip
+ * firing a personal `member_joined` greeting for that SAME user (social-
+ * presence round, Merry). Belt-and-braces guard: at synchronous check-time
+ * within one `VoiceStateUpdate` event, `guildStates` doesn't have an entry
+ * yet for a brand-new auto-join (it's only set once `startVoicePipeline`'s
+ * async connection work resolves), so the personal-greeting branch can't
+ * structurally match the same event that triggered auto-join. This debounce
+ * is defense-in-depth against that assumption ever breaking (e.g. Discord
+ * ever bundling more than one `VoiceStateUpdate` for a single join) — it's
+ * what stops `announceSessionStart`'s general "hey everyone" hello and a
+ * redundant personal greeting from both firing for the one person whose
+ * entry just started the pipeline.
+ */
+const AUTO_JOIN_GREETING_DEBOUNCE_MS = 5_000;
+
 export interface BootstrapDeps {
   client: Client;
   config: AppConfig;
@@ -60,6 +77,25 @@ interface GuildRuntimeState {
   /** Users whose STT session is being created (display-name resolution in flight) — guards against a second speaking-start racing in and starting a duplicate session for the same user. */
   pendingSttUsers: Set<string>;
   speakingListener: (userId: string) => void;
+  /**
+   * Proactive-chime-in poll timer (Merry, wiring round) — ticks every
+   * `config.defaults.proactiveChimeIntervalSeconds`, calling
+   * `orchestrator.maybeFireProactiveTurn` only while a real (non-bot) member
+   * is present in the voice channel. `undefined` when the feature is
+   * disabled via `config.defaults.proactiveChimeEnabled` (no timer created
+   * at all, not just a no-op tick) or, defensively, if the interval turned
+   * out non-positive. Always cleared in `stopVoicePipeline` — no timer
+   * outlives its voice connection.
+   */
+  proactiveTimer?: NodeJS.Timeout;
+  /**
+   * Set only when this pipeline start was triggered by auto-join-on-entry
+   * (social-presence round, Merry) — records who triggered it and until
+   * when the personal `member_joined` greeting should be skipped for that
+   * same user. See `AUTO_JOIN_GREETING_DEBOUNCE_MS`'s doc comment. `undefined`
+   * for a manual `/join` start (no triggering user) — nothing to debounce.
+   */
+  autoJoinDebounce?: { userId: string; until: number };
 }
 
 /**
@@ -191,14 +227,74 @@ export class DiscordBotRuntime {
     });
 
     this.deps.client.on(Events.VoiceStateUpdate, (oldState, newState) => {
-      if (!this.deps.config.defaults.autoJoinOnUserEntry) return;
-      if (newState.member?.user.bot) return;
-      if (!newState.channelId || newState.channelId === oldState.channelId) return; // only fresh channel-joins
-      if (this.guildStates.has(newState.guild.id)) return; // already connected somewhere in this guild
-      void this.startVoicePipeline(newState.guild.id, newState.channelId).catch((err) => {
-        log.error("auto-join failed", { guildId: newState.guild.id, error: err instanceof Error ? err.message : String(err) });
+      void this.handleVoiceStateUpdate(oldState, newState).catch((err) => {
+        log.error("voice state update handling failed", {
+          guildId: newState.guild.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
       });
     });
+  }
+
+  /**
+   * Single entry point for every voice-presence reaction (social-presence
+   * round, Merry): (a) auto-join-on-entry (pre-existing), (b) a personal
+   * greeting when a non-bot member joins a channel the bot's already
+   * connected to, (c) a snarky farewell when they leave that same channel.
+   * `freshJoin`/`freshLeave` are computed off channel-id transitions, not
+   * booleans checked independently against unrelated conditions, so a
+   * straight channel SWITCH (leave X, join Y in one event) naturally routes
+   * to at most one of (b)/(c) depending on which channel is the bot's — see
+   * the channel-match guards below, not a redundant "did they leave voice
+   * entirely" check.
+   */
+  private async handleVoiceStateUpdate(oldState: VoiceState, newState: VoiceState): Promise<void> {
+    const isBot = newState.member?.user.bot ?? oldState.member?.user.bot ?? false;
+    if (isBot) return; // never react to a bot's own connection-state changes here (ours included)
+
+    const guildId = newState.guild.id;
+    const userId = newState.id; // same underlying user id for both halves of one VoiceStateUpdate event
+    const joinedChannelId = newState.channelId;
+    const leftChannelId = oldState.channelId;
+    const freshJoin = !!joinedChannelId && joinedChannelId !== leftChannelId;
+    const freshLeave = !!leftChannelId && leftChannelId !== joinedChannelId;
+    if (!freshJoin && !freshLeave) return; // e.g. mute/deafen toggle with no channel change
+
+    const state = this.guildStates.get(guildId);
+
+    // (a) Auto-join-on-entry — bot isn't connected anywhere in this guild yet.
+    if (!state) {
+      if (this.deps.config.defaults.autoJoinOnUserEntry && freshJoin && joinedChannelId) {
+        await this.startVoicePipeline(guildId, joinedChannelId, userId).catch((err) => {
+          log.error("auto-join failed", { guildId, error: err instanceof Error ? err.message : String(err) });
+        });
+      }
+      return;
+    }
+
+    // (b) Someone joined the SAME channel the bot's already sitting in.
+    if (freshJoin && joinedChannelId === state.voiceChannelId) {
+      const debounce = state.autoJoinDebounce;
+      if (debounce && debounce.userId === userId && Date.now() < debounce.until) {
+        log.debug("skipping personal join greeting — same user just triggered auto-join/session-start hello", {
+          guildId,
+          userId,
+        });
+      } else {
+        const displayName = await this.resolveDisplayName(guildId, userId);
+        await this.deps.orchestrator.handleMemberJoinedVoice(guildId, joinedChannelId, userId, displayName).catch((err) => {
+          log.error("member-joined greeting failed", { guildId, userId, error: err instanceof Error ? err.message : String(err) });
+        });
+      }
+    }
+
+    // (c) Someone left that same channel.
+    if (freshLeave && leftChannelId === state.voiceChannelId) {
+      const displayName = await this.resolveDisplayName(guildId, userId);
+      await this.deps.orchestrator.handleMemberLeftVoice(guildId, leftChannelId, userId, displayName).catch((err) => {
+        log.error("member-left farewell failed", { guildId, userId, error: err instanceof Error ? err.message : String(err) });
+      });
+    }
   }
 
   private async dispatchCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -321,7 +417,7 @@ export class DiscordBotRuntime {
   // Voice pipeline (join/leave, receive -> VAD -> STT -> orchestrator)
   // ---------------------------------------------------------------------
 
-  private async startVoicePipeline(guildId: string, channelId: string): Promise<void> {
+  private async startVoicePipeline(guildId: string, channelId: string, autoJoinTriggeringUserId?: string): Promise<void> {
     const existing = this.guildStates.get(guildId);
     if (existing?.voiceChannelId === channelId) return; // already connected there
     if (existing) this.stopVoicePipeline(guildId); // switching channels — tear down first
@@ -348,10 +444,18 @@ export class DiscordBotRuntime {
       sttSessions: new Map(),
       pendingSttUsers: new Set(),
       speakingListener,
+      autoJoinDebounce: autoJoinTriggeringUserId
+        ? { userId: autoJoinTriggeringUserId, until: Date.now() + AUTO_JOIN_GREETING_DEBOUNCE_MS }
+        : undefined,
     };
     this.guildStates.set(guildId, state);
 
     connection.receiver.speaking.on("start", speakingListener);
+    state.proactiveTimer = this.startProactiveTimer(guildId, channelId);
+    // Covers both an explicit /join command and auto-join-on-entry with one
+    // call site (Frodo's recommendation) — connection + playback are fully
+    // attached and per-guild state exists by this point.
+    await this.deps.orchestrator.announceSessionStart(guildId, channelId);
 
     if (textChannelId) {
       // Only post the consent notice if someone currently in the voice channel
@@ -391,6 +495,7 @@ export class DiscordBotRuntime {
     const state = this.guildStates.get(guildId);
     if (!state) return;
 
+    if (state.proactiveTimer) clearInterval(state.proactiveTimer);
     state.connection.receiver.speaking.off("start", state.speakingListener);
 
     for (const [userId, session] of state.sttSessions) {
@@ -403,6 +508,62 @@ export class DiscordBotRuntime {
     this.voiceSessions.leave(guildId);
     this.guildStates.delete(guildId);
     log.info("voice pipeline stopped", { guildId });
+  }
+
+  // ---------------------------------------------------------------------
+  // Proactive chime-in timer (Merry, wiring round) — real voice presence
+  // ---------------------------------------------------------------------
+
+  /**
+   * Starts (or, if the feature is disabled/misconfigured, deliberately does
+   * NOT start) the per-guild proactive-chime poll timer for a freshly
+   * joined voice channel. Wired straight from `AppConfig.defaults`
+   * (`proactiveChimeEnabled`/`proactiveChimeIntervalSeconds`, Sam's config
+   * lock) — `orchestrator.maybeFireProactiveTurn` also checks `enabled`
+   * itself (belt-and-braces, same pattern as this codebase's consent/
+   * opt-out double-checks — see memory/orchestrator.ts's own doc comments),
+   * but skipping timer creation entirely when disabled means a disabled
+   * deployment does zero polling, not just zero-effect polling.
+   *
+   * The interval IS the poll period, not just a lower bound — each tick
+   * either fires or is a no-op, and `TurnTakingEngine.decideProactive`'s own
+   * cadence floor (same config value) is the redundant safety net if
+   * something ever calls `maybeFireProactiveTurn` more often than this.
+   */
+  private startProactiveTimer(guildId: string, channelId: string): NodeJS.Timeout | undefined {
+    const { proactiveChimeEnabled, proactiveChimeIntervalSeconds } = this.deps.config.defaults;
+    if (!proactiveChimeEnabled || proactiveChimeIntervalSeconds <= 0) return undefined;
+
+    return setInterval(() => {
+      void this.maybeFireProactiveChime(guildId, channelId).catch((err) => {
+        log.error("proactive chime tick failed", { guildId, error: err instanceof Error ? err.message : String(err) });
+      });
+    }, proactiveChimeIntervalSeconds * 1000);
+  }
+
+  /**
+   * One timer tick: only calls into the orchestrator while the bot is
+   * genuinely still connected to THIS voice channel (guards against a stale
+   * timer firing once more after the connection was torn down some other
+   * way than `stopVoicePipeline`/a channel switch — defensive, since
+   * `clearInterval` in `stopVoicePipeline` is the primary teardown path)
+   * AND at least one non-bot member is currently sitting in it. Both checks
+   * read directly off discord.js's live gateway-backed caches — no new
+   * presence-tracking state to keep in sync.
+   */
+  private async maybeFireProactiveChime(guildId: string, channelId: string): Promise<void> {
+    if (!this.voiceSessions.isConnected(guildId)) return;
+    const state = this.guildStates.get(guildId);
+    if (!state || state.voiceChannelId !== channelId) return; // torn down / switched channels since this tick was scheduled
+
+    const guild = this.deps.client.guilds.cache.get(guildId);
+    const voiceChannel = guild?.channels.cache.get(channelId);
+    if (!voiceChannel || !voiceChannel.isVoiceBased()) return;
+
+    const humanPresent = voiceChannel.members.some((m) => !m.user.bot);
+    if (!humanPresent) return; // nobody real in the channel — nothing to chime in on
+
+    await this.deps.orchestrator.maybeFireProactiveTurn(guildId, channelId);
   }
 
   private handleUserSpeakingStart(guildId: string, userId: string): void {

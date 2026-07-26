@@ -89,6 +89,7 @@ async function main(): Promise<void> {
     recentTranscript: [segment],
     memoryContext: [],
     triggerReason: "cli explicit test input",
+    recentTones: [], // no per-guild history in the standalone CLI smoke test
   });
 
   console.log(`\nBot text: ${response.text}`);

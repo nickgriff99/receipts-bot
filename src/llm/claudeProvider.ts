@@ -14,6 +14,32 @@ import { logger } from "../shared/logger";
 const log = logger.child("llm:claude");
 
 /**
+ * Tone-variety mechanism (Merry) — named delivery modes `generateResponse`
+ * rotates through, fed into the prompt alongside `LLMRequest.recentTones`
+ * (the bot's own last few picks for this guild). Concrete named modes,
+ * instead of a vague "vary your style" instruction, are what actually make
+ * an LLM rotate over many turns rather than drifting back into one register
+ * — a bare "be varied" ask tends to get ignored in isolation.
+ *
+ * `tone` stays a free-form optional string end-to-end (`LLMRawReplySchema`,
+ * llm/types.ts) rather than a closed Zod enum deliberately: if the model
+ * replies with something outside this list, or omits tone entirely, that
+ * must never fail the whole reply's schema validation and fall back to
+ * losing the "text" field too (see parseLLMReply's lenient-fallback
+ * contract). This list is a prompt-side menu, not a wire-format contract.
+ */
+const RESPONSE_STYLE_MODES = [
+  "roast — needle them (lightly) about something they actually just said or did",
+  "compliment — a genuine, non-sarcastic point of praise or appreciation",
+  "genuine_question — ask something you actually want to know, no punchline attached",
+  "blunt — say the blunt or slightly mean thing straight, without cruelty",
+  "observation — a dry, off-hand comment on the moment, not addressed to anyone in particular",
+  "riff — just riff or joke on the topic, low-stakes, no target",
+  "banter — light, playful back-and-forth teasing, quick and low-stakes, clearly all in good fun",
+  "argue — play up a mock disagreement or friendly-contrarian bit on whatever's being discussed; this is a bit, not real hostility — you don't actually need to be right, just committed to the joke",
+].join("; ");
+
+/**
  * Claude Haiku provider — used for BOTH the cheap ambient pre-check gate
  * AND full response generation (locked decision: no dual-model split,
  * budget is the binding constraint). Model id comes from AppConfig
@@ -42,12 +68,26 @@ export class ClaudeHaikuProvider implements LLMProvider {
   async cheapGateCheck(input: CheapGateInput): Promise<CheapGateResult> {
     const transcriptText = formatTranscript(input.recentTranscript);
     const system = [
-      `You are the ambient-response gate for "${input.persona.name}", a chatty, quick-witted Discord voice co-host who loves to talk.`,
-      "Given the most recent snippet of live voice-chat transcript, decide whether the bot should chime in RIGHT NOW.",
-      "Default strongly to YES — this co-host is very talkative and jumps into the conversation constantly with quips,",
-      "reactions, questions, and commentary. Say yes for almost anything: a joke, a reaction, an observation, a follow-up",
-      "question, or just riffing on whatever was said. Only say no in the rare case where jumping in would clearly talk",
-      "over someone who is still mid-sentence, or would step on a genuinely serious or sensitive moment.",
+      // Rebalanced (frodo, proactive-chime round): the prior version
+      // defaulted strongly to YES for almost everything, which was the
+      // likely root cause of "talks when it isn't addressed / talks too
+      // much" — this call is also now shared by ambient-pause AND
+      // timer-driven proactive candidates (pipeline/turnTaking.ts), so an
+      // unconditional yes-bias would be even more likely to fire into
+      // low-content moments. Direct-address handling below is deliberately
+      // KEPT strongly yes-biased — that's a different failure mode
+      // (under-triggering when clearly addressed) and must not regress.
+      `You are the response gate for "${input.persona.name}", a witty Discord voice co-host who banters, reacts,`,
+      "asks questions, and comments on the conversation — but only when it actually adds something in the moment.",
+      "Given the most recent snippet of live voice-chat transcript, decide whether the bot should speak RIGHT NOW.",
+      "Say YES when: someone is directly addressing the bot (see DIRECT ADDRESS below — always yes there); a joke or",
+      "strong reaction opportunity just landed; someone asked the group a question worth answering; or the",
+      "conversation moved to a fresh topic worth a genuine comment. Say NO when: nothing new has happened since the",
+      "bot's own last line; the snippet is low-content filler (short acknowledgements, half a sentence, background",
+      "noise transcribed as words) with nothing to actually react to; jumping in would clearly talk over someone",
+      "still mid-sentence; or the moment is genuinely serious/sensitive and a quip would land badly. When it's a",
+      "genuinely close call between a real reaction and staying quiet, prefer staying quiet — this bot should feel",
+      "like an attentive participant who picks real moments, not a chatbot replying to every line.",
       `DIRECT ADDRESS: people often talk to the bot WITHOUT using its name — with "you" ("what do you think?", "you`,
       `agree?"), or by referring to it as "him"/"it"/"this guy" ("ask him", "what's it say", "tell this guy"). Use the`,
       `conversation flow to judge who is being addressed — the bot's own recent lines are labeled "${input.persona.name}:",`,
@@ -99,15 +139,38 @@ export class ClaudeHaikuProvider implements LLMProvider {
     const transcriptText = formatTranscript(request.recentTranscript);
     const memoryText = formatMemory(request.memoryContext);
 
+    // Tone-variety mechanism (Merry) — named menu + "what you just did"
+    // history, built fresh per request from `request.recentTones` (oldest
+    // first, capped in orchestrator.ts). See RESPONSE_STYLE_MODES doc
+    // comment for why this is concrete named modes rather than a vague
+    // "be varied" instruction.
+    const recentTonesLine =
+      request.recentTones.length > 0
+        ? `Your last few replies used these modes, oldest first: ${request.recentTones.join(", ")}. Do NOT use that most-recent mode again right now — pick a genuinely different one from the menu below, unless staying warm/gentle is clearly still the right call (e.g. someone is still visibly upset).`
+        : "You have no recent-mode history yet for this conversation — pick whichever mode below actually fits the moment.";
+
     const system = [
       request.persona.systemPrompt,
       `Your own recent lines appear in the transcript labeled "${request.persona.name}:". Do NOT repeat points`,
       "you already made or rephrase a reaction you already gave — if you've already addressed the current topic,",
       "either add a genuinely new angle or reply with empty text. Track where the conversation is RIGHT NOW and",
       "respond to the latest thing being discussed, not something already handled a few lines ago.",
-      `Reply with ONLY compact JSON: {"text": "your spoken reply", "tone": "one word, optional"}.`,
+      `Vary your delivery style turn to turn using this menu of named modes: ${RESPONSE_STYLE_MODES}.`,
+      recentTonesLine,
+      "Pick whichever mode genuinely fits what's happening right now — never force a roast or blunt line into a",
+      "moment that calls for something else, and the hard line from your persona above (never target real sensitive",
+      "traits like appearance/identity/ability, always drop the bite and go warm if someone seems genuinely upset)",
+      "applies to every mode, roast/blunt/banter/argue included, with no exceptions. \"argue\" specifically means a",
+      "played-up, obviously-a-bit mock disagreement or friendly-contrarian stance — never genuine hostility, never",
+      "escalate it into a real fight, and drop it immediately (same as any other mode) if the moment turns genuinely",
+      "serious.",
+      'Reply with ONLY compact JSON: {"text": "your spoken reply", "tone": "the mode name you picked, e.g. roast/compliment/genuine_question/blunt/observation/riff/banter/argue"}.',
       `Keep "text" to at most ${request.persona.maxResponseSentences} sentences.`,
-      "If there is truly nothing worth saying, reply with {\"text\": \"\"}.",
+      "If there is truly nothing worth saying, reply with {\"text\": \"\"} — but this escape hatch is for ordinary",
+      "ambient/proactive turns only. If the \"Why you're responding now\" reason below says someone specifically just",
+      "joined the voice channel, just left the voice channel, or that you just connected to the channel, that is a",
+      "rare, deliberate moment meant for you to actually speak — always give a real, on-topic spoken line for those",
+      "(even a brief one), never fall back to empty text for them.",
     ].join(" ");
 
     const userContent = [

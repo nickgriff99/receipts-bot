@@ -43,6 +43,10 @@ async function main(): Promise<void> {
     rateLimiter,
     persona: DEFAULT_PERSONA,
     voiceId: config.elevenlabs.defaultVoiceId,
+    proactive: {
+      intervalSeconds: config.defaults.proactiveChimeIntervalSeconds,
+      enabled: config.defaults.proactiveChimeEnabled,
+    },
   });
 
   const stt = new DeepgramSTTProvider(config.deepgram.apiKey);

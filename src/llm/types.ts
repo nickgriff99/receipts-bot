@@ -50,6 +50,17 @@ export const LLMRequestSchema = z.object({
   memoryContext: z.array(MemoryContextSliceSchema),
   /** Why this turn is happening — explicit mention text, or the cheap-gate's reason. Fed into the prompt for continuity, not shown to end users. */
   triggerReason: z.string(),
+  /**
+   * Tone-variety mechanism (Merry): the bot's own last few `LLMResponse.tone`
+   * values for this guild, oldest first, capped at `MAX_RECENT_TONES_PER_GUILD`
+   * (orchestrator.ts). `generateResponse` feeds this back into the prompt as
+   * "here's what you just did, don't do it again" alongside a named menu of
+   * style modes (see `RESPONSE_STYLE_MODES` in claudeProvider.ts) — a rolling
+   * anti-repetition signal beats a vague "vary your style" instruction, which
+   * models tend to ignore in isolation over many turns. Empty array is the
+   * normal state for a guild's first few turns.
+   */
+  recentTones: z.array(z.string()),
 });
 export type LLMRequest = z.infer<typeof LLMRequestSchema>;
 

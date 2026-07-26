@@ -5,6 +5,8 @@ import {
   FALLBACK_STT_CONFIDENCE_THRESHOLD,
   FALLBACK_ALLOW_AMBIENT_BARGE_IN,
   FALLBACK_AUTO_JOIN_ON_USER_ENTRY,
+  FALLBACK_PROACTIVE_CHIME_INTERVAL_SECONDS,
+  FALLBACK_PROACTIVE_CHIME_ENABLED,
 } from "./constants";
 
 /**
@@ -99,6 +101,18 @@ export const AppConfigSchema = z
      */
     DEFAULT_AUTO_JOIN_ON_USER_ENTRY: boolEnvFlag(FALLBACK_AUTO_JOIN_ON_USER_ENTRY),
 
+    /**
+     * Process-wide only (mirrors `DEFAULT_AUTO_JOIN_ON_USER_ENTRY` precedent
+     * above) — proactive-chime brief (`PROACTIVE_CHIME_ARCHITECTURE.md`
+     * section 4). `_INTERVAL_SECONDS` is the per-guild cadence floor
+     * `TurnTakingEngine.decideProactive` enforces; `_ENABLED` is an
+     * independent master switch so the owner can turn the whole feature off
+     * per-deployment without redeploying code (e.g. mid-incident) even while
+     * leaving the cadence value in place.
+     */
+    DEFAULT_PROACTIVE_CHIME_INTERVAL_SECONDS: z.coerce.number().int().positive().default(FALLBACK_PROACTIVE_CHIME_INTERVAL_SECONDS),
+    DEFAULT_PROACTIVE_CHIME_ENABLED: boolEnvFlag(FALLBACK_PROACTIVE_CHIME_ENABLED),
+
     LOG_LEVEL: LogLevelSchema.default("info"),
   })
   .transform((env) => ({
@@ -134,6 +148,8 @@ export const AppConfigSchema = z
       sttConfidenceThreshold: env.DEFAULT_STT_CONFIDENCE_THRESHOLD,
       allowAmbientBargeIn: env.DEFAULT_ALLOW_AMBIENT_BARGE_IN,
       autoJoinOnUserEntry: env.DEFAULT_AUTO_JOIN_ON_USER_ENTRY,
+      proactiveChimeIntervalSeconds: env.DEFAULT_PROACTIVE_CHIME_INTERVAL_SECONDS,
+      proactiveChimeEnabled: env.DEFAULT_PROACTIVE_CHIME_ENABLED,
     },
     logLevel: env.LOG_LEVEL,
   }));

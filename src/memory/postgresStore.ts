@@ -1,7 +1,7 @@
 import { Pool, types } from "pg";
 import { newId } from "../shared/ids";
 import { logger } from "../shared/logger";
-import { MAX_FACTS_PER_PROFILE } from "../config/constants";
+import { MAX_FACTS_PER_PROFILE, MAX_ENGAGEMENT_OUTCOMES_PER_GUILD } from "../config/constants";
 import { SCHEMA_SQL } from "./schema";
 import type {
   MemoryStore,
@@ -10,6 +10,7 @@ import type {
   ConversationLogEntry,
   UsageLogEntry,
   UsageService,
+  TurnOutcome,
 } from "./types";
 import type { BotMode } from "../config/types";
 
@@ -321,6 +322,45 @@ export class PostgresMemoryStore implements MemoryStore {
     const usage: Record<UsageService, number> = { stt: 0, llm: 0, tts: 0 };
     for (const row of result.rows) usage[row.service] = Number(row.total);
     return usage;
+  }
+
+  async recordTurnOutcome(guildId: string, outcome: TurnOutcome, occurredAt: number): Promise<void> {
+    await this.ready;
+    await this.pool.query(
+      `INSERT INTO turn_outcomes (guild_id, outcome, occurred_at) VALUES ($1, $2, $3)`,
+      [guildId, outcome, occurredAt],
+    );
+    // Retention: cap enforced at the write site (see schema.ts's turn_outcomes
+    // comment) — keep only the newest MAX_ENGAGEMENT_OUTCOMES_PER_GUILD rows
+    // for this guild, same semantics as frodo's original in-process ring
+    // buffer, just ported to a real DELETE instead of an array splice.
+    await this.pool.query(
+      `DELETE FROM turn_outcomes
+       WHERE guild_id = $1
+         AND id NOT IN (
+           SELECT id FROM turn_outcomes WHERE guild_id = $1 ORDER BY occurred_at DESC LIMIT $2
+         )`,
+      [guildId, MAX_ENGAGEMENT_OUTCOMES_PER_GUILD],
+    );
+  }
+
+  async getRecentEngagementStats(guildId: string): Promise<{ landed: number; flopped: number }> {
+    await this.ready;
+    // LIMIT here is defense-in-depth, not the primary bound (recordTurnOutcome's
+    // DELETE already keeps this table at <= MAX_ENGAGEMENT_OUTCOMES_PER_GUILD
+    // rows per guild) — cheap insurance against reading a stale/over-grown
+    // set if a prune ever fails to run.
+    const result = await this.pool.query<{ outcome: TurnOutcome }>(
+      `SELECT outcome FROM turn_outcomes WHERE guild_id = $1 ORDER BY occurred_at DESC LIMIT $2`,
+      [guildId, MAX_ENGAGEMENT_OUTCOMES_PER_GUILD],
+    );
+    let landed = 0;
+    let flopped = 0;
+    for (const row of result.rows) {
+      if (row.outcome === "landed") landed++;
+      else flopped++;
+    }
+    return { landed, flopped };
   }
 
   async close(): Promise<void> {

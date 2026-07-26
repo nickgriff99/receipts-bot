@@ -9,6 +9,10 @@ export const FALLBACK_MIN_GAP_SECONDS = 10;
 export const FALLBACK_STT_CONFIDENCE_THRESHOLD = 0.6;
 export const FALLBACK_ALLOW_AMBIENT_BARGE_IN = false;
 export const FALLBACK_AUTO_JOIN_ON_USER_ENTRY = false;
+/** Timer-driven proactive-chime cadence floor, seconds (brief: "~once per 2 minutes"). */
+export const FALLBACK_PROACTIVE_CHIME_INTERVAL_SECONDS = 120;
+/** Master on/off switch for the proactive-chime feature, independent of cadence. */
+export const FALLBACK_PROACTIVE_CHIME_ENABLED = true;
 
 /** How many recent transcript segments the context assembler pulls into an LLM request. */
 export const CONTEXT_WINDOW_UTTERANCES = 15;
@@ -40,3 +44,26 @@ export const MAX_FACTS_PER_PROFILE = 40;
 export const MAX_RUNNING_JOKES_PER_PROFILE = 20;
 export const MAX_FACT_LENGTH = 240;
 export const MAX_SENTIMENT_NOTES_LENGTH = 500;
+
+/**
+ * Adaptive-cadence learning signal (Sam, durability round — see
+ * memory/schema.ts's `turn_outcomes` table): how many of the most recent
+ * resolved turn outcomes `PostgresMemoryStore` keeps per guild. Same number
+ * (40) and same "newest N, oldest dropped" semantics as frodo's original
+ * in-process ring buffer (`ENGAGEMENT_RING_SIZE`), just enforced at the SQL
+ * layer now — every `recordTurnOutcome` write prunes back down to this cap
+ * so the table can't grow unbounded, same "cap enforced at the write site"
+ * philosophy as `MAX_FACTS_PER_PROFILE` above, not the passive/manual
+ * `pruneOldLogs` pattern `conversation_log` uses (that table needs full
+ * history for its own reasons; this signal only ever needs the last N).
+ */
+export const MAX_ENGAGEMENT_OUTCOMES_PER_GUILD = 40;
+
+/**
+ * Tone-variety round (Merry): how many of the bot's own most-recent reply
+ * `tone` tags `PipelineOrchestrator` keeps per guild, oldest dropped first.
+ * Fed into `LLMRequest.recentTones` so `generateResponse`'s prompt can say
+ * "don't repeat the mode you just used" — small on purpose, this is a
+ * short-term anti-repetition nudge, not a style-preference profile.
+ */
+export const MAX_RECENT_TONES_PER_GUILD = 4;

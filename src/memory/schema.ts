@@ -101,4 +101,31 @@ CREATE TABLE IF NOT EXISTS usage_log (
   occurred_at  BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_usage_log_guild_time ON usage_log (guild_id, occurred_at);
+
+-- Adaptive-cadence learning signal (social-presence round, frodo's
+-- MemoryStore.recordTurnOutcome/getRecentEngagementStats -- see types.ts's
+-- TurnOutcomeSchema doc comment for the exact landed/flopped definitions).
+-- Promoted off frodo's temporary in-process ring buffer to real persistence
+-- this round (Sam) so the signal survives a bot restart. The id BIGSERIAL
+-- column is this table's own addition (not in the original ring-buffer
+-- shape) -- needed as a stable per-row handle for the retention DELETE
+-- below, since (guild_id, occurred_at) isn't guaranteed unique (two
+-- outcomes can resolve in the same millisecond).
+--
+-- Retention: unlike conversation_log (unbounded, manual pruneOldLogs, no
+-- auto cron — documented gap in ARCHITECTURE.md), this table is actively
+-- capped at write time, same "cap enforced at the write site" philosophy as
+-- MAX_FACTS_PER_PROFILE's dedupeAppend truncation — every
+-- PostgresMemoryStore#recordTurnOutcome call deletes back down to the newest
+-- MAX_ENGAGEMENT_OUTCOMES_PER_GUILD (config/constants.ts) rows for that
+-- guild right after inserting. Chosen over a passive/manual prune because
+-- this table, unlike conversation_log, has no reason to ever keep more than
+-- the last N rows per guild — nothing here is an audit/compliance log.
+CREATE TABLE IF NOT EXISTS turn_outcomes (
+  id           BIGSERIAL PRIMARY KEY,
+  guild_id     TEXT NOT NULL,
+  outcome      TEXT NOT NULL CHECK (outcome IN ('landed', 'flopped')),
+  occurred_at  BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_turn_outcomes_guild_time ON turn_outcomes (guild_id, occurred_at DESC);
 `;

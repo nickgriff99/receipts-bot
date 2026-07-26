@@ -83,6 +83,26 @@ export const GuildSettingsSchema = z.object({
 });
 export type GuildSettings = z.infer<typeof GuildSettingsSchema>;
 
+/**
+ * Adaptive-cadence learning signal (social-presence round, frodo — brief
+ * section 5: "actively learning when a good time to talk is"). Recorded
+ * once per resolved non-explicit (ambient_pause or proactive) bot turn —
+ * never for explicit triggers (mention/reply/name) or system events
+ * (member_joined/member_left/session_start), none of which are a timing
+ * judgment call. See `PipelineOrchestrator`'s doc comment on
+ * `pendingEngagementByGuild` for the exact operational definition:
+ *
+ * - "landed": a human (consented, non-opted-out — the only kind that ever
+ *   reaches `handleSegment`) final transcript segment was observed, started
+ *   at or after the bot's reply finished playing, within the follow-up
+ *   window.
+ * - "flopped": either the follow-up window elapsed with no such segment
+ *   (silence), OR a human segment arrived that had already started before
+ *   the bot's reply finished (talked over).
+ */
+export const TurnOutcomeSchema = z.enum(["landed", "flopped"]);
+export type TurnOutcome = z.infer<typeof TurnOutcomeSchema>;
+
 export const UsageServiceSchema = z.enum(["stt", "llm", "tts"]);
 export type UsageService = z.infer<typeof UsageServiceSchema>;
 
@@ -132,6 +152,28 @@ export interface MemoryStore {
   logUsage(entry: Omit<UsageLogEntry, "id">): Promise<void>;
   /** Sum of units per service since a timestamp, for cost auditing / dashboards. */
   getUsageSince(guildId: string, sinceTimestamp: number): Promise<Record<UsageService, number>>;
+
+  /**
+   * Adaptive-cadence learning signal (see `TurnOutcomeSchema` above) —
+   * record one resolved outcome. Persisted to a real `turn_outcomes` table
+   * (`memory/schema.ts`) as of the durability round (Sam) — promoted off
+   * frodo's original temporary in-process ring buffer so this signal
+   * survives a bot restart. `PostgresMemoryStore#recordTurnOutcome` prunes
+   * back down to `MAX_ENGAGEMENT_OUTCOMES_PER_GUILD` (config/constants.ts)
+   * rows per guild on every write — same "cap enforced at the write site"
+   * semantics as the old ring buffer, just backed by a real DELETE now.
+   */
+  recordTurnOutcome(guildId: string, outcome: TurnOutcome, occurredAt: number): Promise<void>;
+  /**
+   * Aggregated recent landed/flopped counts for a guild — consumed by
+   * `TurnTakingEngine` to damp (ambient) or rescale the cadence floor
+   * (proactive) when recent turns have mostly flopped. "Recent" window is
+   * this store's call (currently: last `MAX_ENGAGEMENT_OUTCOMES_PER_GUILD`
+   * outcomes per guild, enforced at write time — see `PostgresMemoryStore`)
+   * — the consumer only reads aggregate counts and treats a low/zero sample
+   * count as "no signal yet", never as an implicit 0% landed rate.
+   */
+  getRecentEngagementStats(guildId: string): Promise<{ landed: number; flopped: number }>;
 
   close(): Promise<void>;
 }
