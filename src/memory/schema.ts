@@ -67,11 +67,20 @@ CREATE TABLE IF NOT EXISTS guild_settings (
   allow_ambient_barge_in     BOOLEAN NOT NULL DEFAULT FALSE,
   voice_id                   TEXT,
   consent_channel_id         TEXT,
+  max_explicit_responses_per_minute INTEGER,
   updated_at                 BIGINT NOT NULL
 );
 
 -- Same live-DB-already-exists situation as user_profiles above.
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS consent_channel_id TEXT;
+
+-- Sam's contract-review follow-up (conversation-continuity round) --
+-- optional per-guild override for RateLimiterConfig.maxExplicitResponsesPerMinute
+-- (pipeline/types.ts). Nullable, no DEFAULT -- NULL means "not configured for
+-- this guild", read as undefined by rowToSettings and handled by the rate
+-- limiter's existing undefined-means-shared-cap fallback. Same
+-- already-live-table situation as consent_channel_id above.
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS max_explicit_responses_per_minute INTEGER;
 
 
 -- Rolling raw transcript log. Text only — never raw audio (brief section 8).
@@ -125,7 +134,22 @@ CREATE TABLE IF NOT EXISTS turn_outcomes (
   id           BIGSERIAL PRIMARY KEY,
   guild_id     TEXT NOT NULL,
   outcome      TEXT NOT NULL CHECK (outcome IN ('landed', 'flopped')),
+  category     TEXT NOT NULL DEFAULT 'ambient' CHECK (category IN ('continuation', 'ambient', 'interjection', 'proactive')),
   occurred_at  BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_turn_outcomes_guild_time ON turn_outcomes (guild_id, occurred_at DESC);
+
+-- Situation-type dimension (conversation-continuity round, frodo — see
+-- memory/types.ts's TurnOutcomeCategorySchema doc comment). Live DB already
+-- has turn_outcomes from the durability round, before this column existed --
+-- same "CREATE TABLE IF NOT EXISTS is a no-op against an existing table"
+-- situation as consent_accepted/consent_channel_id above, so a real ALTER is
+-- needed too. DEFAULT 'ambient' backfills every pre-existing row as the
+-- closest honest label (the old lump signal only ever recorded
+-- ambient_pause/proactive turns, and this default only affects historical
+-- rows already written before proactive had its own category -- new
+-- proactive rows always pass 'proactive' explicitly at the application
+-- layer, so no live proactive row is mislabeled going forward).
+ALTER TABLE turn_outcomes ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'ambient' CHECK (category IN ('continuation', 'ambient', 'interjection', 'proactive'));
+CREATE INDEX IF NOT EXISTS idx_turn_outcomes_guild_category_time ON turn_outcomes (guild_id, category, occurred_at DESC);
 `;

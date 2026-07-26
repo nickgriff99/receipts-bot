@@ -79,6 +79,22 @@ export const GuildSettingsSchema = z.object({
   voiceId: z.string().min(1).optional(), // overrides ELEVENLABS_VOICE_ID default
   /** Admin-pinned consent-notice channel (`/setconsentchannel`) — checked first in `resolveTextChannelId`, falls back to the existing same-name/system/first-sendable chain if unset or no longer sendable. */
   consentChannelId: z.string().min(1).optional(),
+  /**
+   * Per-guild override for `RateLimiterConfig.maxExplicitResponsesPerMinute`
+   * (`pipeline/types.ts`, conversation-continuity round task 2 fix) — Sam's
+   * contract-review follow-up. `undefined` (every guild's default until an
+   * operator opts in via the `/admin/guilds/:guildId/settings` PUT route,
+   * same as `voiceId`/`consentChannelId`'s optional-override pattern above)
+   * preserves the rate limiter's pre-existing shared-cap fallback behavior
+   * — this field exists so an operator CAN give explicit-address turns
+   * their own budget, not so it's on by default. No matching env default
+   * (unlike `maxResponsesPerMinute`/`minGapSeconds`) — the investigation
+   * that motivated this field (`CONVERSATION_CONTINUITY_ARCHITECTURE.md`
+   * section 2b) concluded it's a low-probability edge case under current
+   * defaults, so it should be dialed in per-guild if/when live testing
+   * actually shows a need, not defaulted on process-wide.
+   */
+  maxExplicitResponsesPerMinute: z.number().int().positive().optional(),
   updatedAt: z.number().int().nonnegative(),
 });
 export type GuildSettings = z.infer<typeof GuildSettingsSchema>;
@@ -102,6 +118,50 @@ export type GuildSettings = z.infer<typeof GuildSettingsSchema>;
  */
 export const TurnOutcomeSchema = z.enum(["landed", "flopped"]);
 export type TurnOutcome = z.infer<typeof TurnOutcomeSchema>;
+
+/**
+ * Situation-type dimension on the adaptive-learning signal (conversation-
+ * continuity round, frodo — brief section 6: "learn how and when to
+ * respond IN THESE SITUATIONS", plural). Prior rounds recorded one
+ * guild-wide lump landed/flopped counter with no notion of WHICH kind of
+ * non-explicit turn it was; this splits that into four buckets so the
+ * cadence-gating logic in `pipeline/turnTaking.ts` can learn each
+ * situation's own landed:flopped ratio instead of one blended average:
+ *
+ * - "continuation": an `ambient_pause` candidate that hit an active
+ *   conversation-thread match (`TurnCandidate.activeThreadContinuation`,
+ *   `pipeline/types.ts`) — the bot replying to someone it JUST
+ *   greeted/answered, without them re-saying its name.
+ * - "ambient": a plain `ambient_pause` candidate that went through the
+ *   ordinary cheap-gate and got a YES — pre-existing behavior, same
+ *   meaning as the old single "ambient/proactive" lump minus the other
+ *   three buckets now split out.
+ * - "interjection": the new, rarer, higher-bar "worth jumping into this
+ *   specific pause" check (`TurnTakingEngine`'s `decideInterjection`) fired
+ *   even though (or without ever asking) the generic ambient gate said yes.
+ * - "proactive": timer-driven chime-in, unchanged meaning from before.
+ *
+ * Deliberately NOT tracked for explicit_mention/explicit_reply/explicit_name
+ * (still "always correct to answer", no timing judgment to learn from —
+ * same reasoning the original lump signal used to exclude all explicit
+ * triggers, unchanged this round) or member_joined/member_left/session_start
+ * (rare, bounded system events, not a timing judgment either).
+ *
+ * Sample-size tradeoff, flagged deliberately: splitting one lump counter
+ * into four buckets means each bucket individually reaches
+ * `ENGAGEMENT_MIN_SAMPLES` (turnTaking.ts) roughly 4x slower than the old
+ * single counter did. Accepted per the owner's explicit ask for
+ * situation-specific learning over a faster-but-blended average.
+ */
+export const TurnOutcomeCategorySchema = z.enum(["continuation", "ambient", "interjection", "proactive"]);
+export type TurnOutcomeCategory = z.infer<typeof TurnOutcomeCategorySchema>;
+
+/** One category's landed/flopped counts — same shape reused for the overall aggregate and each per-category bucket below. */
+export const EngagementBucketSchema = z.object({
+  landed: z.number().int().nonnegative(),
+  flopped: z.number().int().nonnegative(),
+});
+export type EngagementBucket = z.infer<typeof EngagementBucketSchema>;
 
 export const UsageServiceSchema = z.enum(["stt", "llm", "tts"]);
 export type UsageService = z.infer<typeof UsageServiceSchema>;
@@ -155,25 +215,32 @@ export interface MemoryStore {
 
   /**
    * Adaptive-cadence learning signal (see `TurnOutcomeSchema` above) —
-   * record one resolved outcome. Persisted to a real `turn_outcomes` table
-   * (`memory/schema.ts`) as of the durability round (Sam) — promoted off
-   * frodo's original temporary in-process ring buffer so this signal
-   * survives a bot restart. `PostgresMemoryStore#recordTurnOutcome` prunes
-   * back down to `MAX_ENGAGEMENT_OUTCOMES_PER_GUILD` (config/constants.ts)
-   * rows per guild on every write — same "cap enforced at the write site"
-   * semantics as the old ring buffer, just backed by a real DELETE now.
+   * record one resolved outcome, tagged with WHICH situation-type produced
+   * it (`TurnOutcomeCategorySchema`, conversation-continuity round).
+   * Persisted to a real `turn_outcomes` table (`memory/schema.ts`) as of the
+   * durability round (Sam) — promoted off frodo's original temporary
+   * in-process ring buffer so this signal survives a bot restart.
+   * `PostgresMemoryStore#recordTurnOutcome` prunes back down to
+   * `MAX_ENGAGEMENT_OUTCOMES_PER_GUILD` (config/constants.ts) rows PER
+   * (guild, category) on every write — same "cap enforced at the write
+   * site" semantics as the old ring buffer, just backed by a real DELETE
+   * now, scoped per-category so one noisy category can't evict another's
+   * history.
    */
-  recordTurnOutcome(guildId: string, outcome: TurnOutcome, occurredAt: number): Promise<void>;
+  recordTurnOutcome(guildId: string, outcome: TurnOutcome, occurredAt: number, category: TurnOutcomeCategory): Promise<void>;
   /**
-   * Aggregated recent landed/flopped counts for a guild — consumed by
-   * `TurnTakingEngine` to damp (ambient) or rescale the cadence floor
-   * (proactive) when recent turns have mostly flopped. "Recent" window is
-   * this store's call (currently: last `MAX_ENGAGEMENT_OUTCOMES_PER_GUILD`
-   * outcomes per guild, enforced at write time — see `PostgresMemoryStore`)
-   * — the consumer only reads aggregate counts and treats a low/zero sample
-   * count as "no signal yet", never as an implicit 0% landed rate.
+   * Recent landed/flopped counts for a guild, both as one blended `overall`
+   * total (kept for any caller that still wants a single guild-wide signal)
+   * and split per `TurnOutcomeCategory` in `byCategory` (conversation-
+   * continuity round — see `TurnOutcomeCategorySchema`'s doc comment for
+   * why). A category absent from `byCategory` means zero recorded outcomes
+   * for it yet — callers must treat that the same as a present-but-empty
+   * `{landed: 0, flopped: 0}` bucket: "no signal yet", never an implicit 0%
+   * landed rate. "Recent" window is this store's call (currently: last
+   * `MAX_ENGAGEMENT_OUTCOMES_PER_GUILD` outcomes per (guild, category),
+   * enforced at write time — see `PostgresMemoryStore`).
    */
-  getRecentEngagementStats(guildId: string): Promise<{ landed: number; flopped: number }>;
+  getRecentEngagementStats(guildId: string): Promise<{ overall: EngagementBucket; byCategory: Partial<Record<TurnOutcomeCategory, EngagementBucket>> }>;
 
   close(): Promise<void>;
 }

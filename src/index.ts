@@ -32,7 +32,15 @@ async function main(): Promise<void> {
   const playback = new DiscordPlaybackController();
   const rateLimiter = new InMemoryRateLimiter(async (guildId) => {
     const settings = await memory.getGuildSettings(guildId);
-    return { maxResponsesPerMinute: settings.maxResponsesPerMinute, minGapSeconds: settings.minGapSeconds };
+    return {
+      maxResponsesPerMinute: settings.maxResponsesPerMinute,
+      minGapSeconds: settings.minGapSeconds,
+      // Sam's contract-review follow-up (conversation-continuity round) —
+      // per-guild opt-in via the admin API (GuildSettings.maxExplicitResponsesPerMinute,
+      // memory/types.ts); undefined until an operator sets it, preserving
+      // the limiter's existing shared-cap fallback exactly.
+      maxExplicitResponsesPerMinute: settings.maxExplicitResponsesPerMinute,
+    };
   });
 
   const orchestrator = new PipelineOrchestrator({

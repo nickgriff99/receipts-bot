@@ -1,14 +1,21 @@
 import type { TranscriptSegment } from "../stt/types";
 import type { LLMProvider, PersonaConfig } from "../llm/types";
 import type { TTSProvider } from "../tts/types";
-import type { MemoryStore, TurnOutcome } from "../memory/types";
+import type { MemoryStore, TurnOutcome, TurnOutcomeCategory } from "../memory/types";
 import type { PlaybackController, PlaybackPriority } from "../discord/types";
 import type { RateLimiter } from "./types";
 import type { TriggerType, TurnCandidate } from "./types";
 import { isExplicitTrigger, PROACTIVE_TRIGGER_USER_ID, SESSION_START_TRIGGER_USER_ID } from "./types";
 import { TurnTakingEngine } from "./turnTaking";
 import { ContextAssembler } from "./contextAssembler";
-import { BOT_SPEAKER_ID, CONTEXT_WINDOW_UTTERANCES, LATENCY_WARN_THRESHOLD_MS, MAX_RECENT_TONES_PER_GUILD, PLAYBACK_AWAIT_TIMEOUT_MS } from "../config/constants";
+import {
+  ACTIVE_THREAD_TTL_MS,
+  BOT_SPEAKER_ID,
+  CONTEXT_WINDOW_UTTERANCES,
+  LATENCY_WARN_THRESHOLD_MS,
+  MAX_RECENT_TONES_PER_GUILD,
+  PLAYBACK_AWAIT_TIMEOUT_MS,
+} from "../config/constants";
 import { logger } from "../shared/logger";
 
 const log = logger.child("pipeline:orchestrator");
@@ -35,6 +42,16 @@ interface TurnWorkItem {
    * for every other trigger type.
    */
   contextHint?: string;
+  /**
+   * Conversation-continuity round (Merry, wiring pass) — display name for
+   * `triggeringUserId`, needed by `setActiveThread` on trigger types that
+   * have no `segment` to pull a display name from (currently only
+   * `member_joined` — see `ACTIVE_THREAD_ELIGIBLE_TRIGGERS`'s doc comment).
+   * Every OTHER active-thread-eligible trigger type always carries a
+   * `segment` (all come through `handleSegment`), so this stays `undefined`
+   * there and `runTurn` prefers `segment.displayName` when both are present.
+   */
+  triggeringDisplayName?: string;
 }
 
 /**
@@ -58,6 +75,42 @@ const ENGAGEMENT_FOLLOWUP_WINDOW_MS = 45_000;
 interface PendingEngagement {
   botSpeechEndedAt: number;
   deadline: number;
+  /**
+   * Conversation-continuity round (task 6) — which `TurnOutcomeCategory`
+   * this window belongs to, threaded straight from `TurnDecision.category`
+   * so the eventual landed/flopped resolution gets recorded against the
+   * right situation-type bucket instead of one guild-wide lump.
+   */
+  category: TurnOutcomeCategory;
+}
+
+/**
+ * One open "the bot is currently mid-conversation with this specific
+ * person" window (task 1, conversation-continuity round) — the code-level,
+ * deterministic fix for the "Nick" scenario: the bot explicitly addresses
+ * someone (or replies to their ambient comment), they reply WITHOUT saying
+ * the bot's name again, and that reply should still reliably continue the
+ * exchange rather than rolling the dice on the generic ambient cheap-gate.
+ *
+ * Set in `runTurn` right after a turn that (a) produced a real, non-empty
+ * spoken reply, and (b) was clearly directed at/prompted by a specific real
+ * user — see `qualifiesForActiveThread`'s doc comment for the exact
+ * trigger-type allowlist. Consumed by `getActiveThreadContinuation`, which
+ * `runTurn` calls when building the NEXT `ambient_pause` candidate's
+ * `TurnCandidate.activeThreadContinuation` field — `TurnTakingEngine.decide`
+ * treats its presence as at least as reliable as an explicit trigger.
+ *
+ * TTL-based, not resolved/cleared by a reply the way `PendingEngagement`
+ * is — deliberately simple for v1 (a real reply from that person before
+ * `expiresAt` just naturally produces a NEW active-thread window from that
+ * turn, extending the conversation; there's no need to explicitly "close"
+ * the old one early). Per-guild, per-user map (not a single guild-wide
+ * slot) since more than one person could plausibly be mid-exchange with the
+ * bot inside the same TTL window, however rare in practice.
+ */
+interface ActiveThreadState {
+  displayName: string;
+  expiresAt: number;
 }
 
 /**
@@ -169,6 +222,12 @@ export class PipelineOrchestrator {
    * point it sets this.
    */
   private readonly pendingEngagementByGuild = new Map<string, PendingEngagement>();
+  /**
+   * Active conversation-thread tracker (task 1, conversation-continuity
+   * round) — see `ActiveThreadState`'s doc comment above for the full
+   * operational definition. Keyed guildId -> userId -> state.
+   */
+  private readonly activeThreadByGuild = new Map<string, Map<string, ActiveThreadState>>();
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.turnTaking = new TurnTakingEngine(deps.llm, deps.rateLimiter, deps.memory, deps.proactive?.intervalSeconds);
@@ -346,7 +405,14 @@ export class PipelineOrchestrator {
       endedAt: now,
     });
 
-    this.enqueueTurn({ guildId, channelId, triggerType: "member_joined", triggeringUserId: userId, contextHint });
+    this.enqueueTurn({
+      guildId,
+      channelId,
+      triggerType: "member_joined",
+      triggeringUserId: userId,
+      contextHint,
+      triggeringDisplayName: displayName,
+    });
   }
 
   /**
@@ -492,6 +558,13 @@ export class PipelineOrchestrator {
   }
 
   private async runTurn(item: TurnWorkItem): Promise<void> {
+    // Active-thread continuation (task 1): only ambient_pause candidates
+    // ever consult this — explicit triggers already bypass the cheap gate
+    // outright, and proactive/system-event candidates have no real
+    // per-person `triggeringUserId` to match against.
+    const activeThreadContinuation =
+      item.triggerType === "ambient_pause" ? this.getActiveThreadContinuation(item.guildId, item.triggeringUserId) : undefined;
+
     const candidate: TurnCandidate = {
       guildId: item.guildId,
       channelId: item.channelId,
@@ -500,6 +573,7 @@ export class PipelineOrchestrator {
       segments: this.historyFor(item.guildId),
       detectedAt: Date.now(),
       contextHint: item.contextHint,
+      activeThreadContinuation,
     };
 
     const decision = await this.turnTaking.decide(candidate, this.deps.persona);
@@ -508,11 +582,12 @@ export class PipelineOrchestrator {
       triggerType: item.triggerType,
       shouldRespond: decision.shouldRespond,
       reason: decision.reason,
+      category: decision.category,
     });
 
     if (!decision.shouldRespond) return;
 
-    this.deps.rateLimiter.recordResponse(item.guildId);
+    this.deps.rateLimiter.recordResponse(item.guildId, { bypassCooldown: decision.bypassCooldown });
 
     const request = await this.contextAssembler.assemble(
       candidate,
@@ -551,6 +626,24 @@ export class PipelineOrchestrator {
     // (`tone` omitted by the model) leave history unchanged rather than
     // pushing an empty placeholder.
     this.recordTone(item.guildId, response.tone);
+
+    // Active-thread continuation (task 1): a real, non-empty reply just
+    // went out — if it was clearly directed at/prompted by a specific real
+    // user, open (or refresh) that person's continuation window so their
+    // NEXT ambient segment gets treated at least as reliably as an explicit
+    // trigger. See `ACTIVE_THREAD_ELIGIBLE_TRIGGERS`'s doc comment for the
+    // exact trigger-type allowlist and why member_left/proactive/
+    // session_start are excluded. Display name prefers `item.segment`
+    // (every explicit/ambient trigger always carries one) and falls back to
+    // `item.triggeringDisplayName` for triggers with no segment at all
+    // (currently only member_joined — see `TurnWorkItem.triggeringDisplayName`'s
+    // doc comment).
+    if (PipelineOrchestrator.ACTIVE_THREAD_ELIGIBLE_TRIGGERS.has(item.triggerType)) {
+      const displayName = item.segment?.displayName ?? item.triggeringDisplayName;
+      if (displayName) {
+        this.setActiveThread(item.guildId, item.triggeringUserId, displayName);
+      }
+    }
 
     const priority: PlaybackPriority = isExplicitTrigger(item.triggerType) ? "explicit" : "ambient";
 
@@ -610,9 +703,15 @@ export class PipelineOrchestrator {
     // ambient/proactive turn — see `pendingEngagementByGuild`'s doc comment.
     if (item.triggerType === "ambient_pause" || item.triggerType === "proactive") {
       const botSpeechEndedAt = Date.now();
+      // `decision.category` should always be set for these two trigger
+      // types (turnTaking.ts's `decide` sets it on every ambient_pause/
+      // proactive branch that returns shouldRespond: true) — the fallback
+      // here is defense-in-depth only, not the expected path.
+      const category: TurnOutcomeCategory = decision.category ?? (item.triggerType === "proactive" ? "proactive" : "ambient");
       this.pendingEngagementByGuild.set(item.guildId, {
         botSpeechEndedAt,
         deadline: botSpeechEndedAt + ENGAGEMENT_FOLLOWUP_WINDOW_MS,
+        category,
       });
     }
 
@@ -674,10 +773,11 @@ export class PipelineOrchestrator {
 
     this.pendingEngagementByGuild.delete(segment.guildId);
     const outcome: TurnOutcome = segment.startedAt < pending.botSpeechEndedAt ? "flopped" : "landed";
-    void this.deps.memory.recordTurnOutcome(segment.guildId, outcome, Date.now()).catch((err) => {
+    void this.deps.memory.recordTurnOutcome(segment.guildId, outcome, Date.now(), pending.category).catch((err) => {
       log.error("failed to record turn-outcome engagement signal", {
         guildId: segment.guildId,
         outcome,
+        category: pending.category,
         error: err instanceof Error ? err.message : String(err),
       });
     });
@@ -701,12 +801,93 @@ export class PipelineOrchestrator {
     if (Date.now() <= pending.deadline) return;
 
     this.pendingEngagementByGuild.delete(guildId);
-    void this.deps.memory.recordTurnOutcome(guildId, "flopped", Date.now()).catch((err) => {
+    void this.deps.memory.recordTurnOutcome(guildId, "flopped", Date.now(), pending.category).catch((err) => {
       log.error("failed to record expired turn-outcome (flopped)", {
         guildId,
+        category: pending.category,
         error: err instanceof Error ? err.message : String(err),
       });
     });
+  }
+
+  /**
+   * Trigger types whose bot reply counts as "clearly directed at/prompted
+   * by a specific real person" for the active-thread continuation tracker
+   * (task 1). Explicit address triggers are the core case (the "Nick"
+   * scenario); ambient_pause is included too since the cheap-gate saying
+   * yes to react to that exact segment is itself evidence the reply was a
+   * response to that speaker's specific comment.
+   *
+   * `member_joined` added (Merry, conversation-continuity wiring pass) — a
+   * personal greeting-by-name is exactly as "directed at" someone as an
+   * explicit trigger; the only reason it was excluded originally was that
+   * `TurnWorkItem` had no display name to plumb through for a trigger type
+   * with no `segment`. Fixed via `TurnWorkItem.triggeringDisplayName` (set
+   * by `handleMemberJoinedVoice`) — `runTurn`'s call to `setActiveThread`
+   * now falls back to it when `item.segment` is absent. Net effect: if a new
+   * joiner replies to the bot's greeting without saying its name, that reply
+   * (an ordinary `ambient_pause` segment from them) now reliably matches an
+   * open continuation window instead of rolling the ambient cheap-gate dice.
+   *
+   * Still deliberately EXCLUDED:
+   * - `member_left` — the greeted/farewelled person has already left the
+   *   voice channel by the time the bot's remark plays, so there is no
+   *   "their next reply" to continue in the first place (Frodo's judgment
+   *   call, confirmed here: a farewell has no reply to continue).
+   * - `session_start` — sentinel `triggeringUserId`
+   *   (`SESSION_START_TRIGGER_USER_ID`), not a specific real person; there
+   *   is no individual to open a continuation window with.
+   * - `proactive` — sentinel `triggeringUserId`
+   *   (`PROACTIVE_TRIGGER_USER_ID`), same reason as `session_start`.
+   */
+  private static readonly ACTIVE_THREAD_ELIGIBLE_TRIGGERS: ReadonlySet<TriggerType> = new Set<TriggerType>([
+    "explicit_mention",
+    "explicit_reply",
+    "explicit_name",
+    "ambient_pause",
+    "member_joined",
+  ]);
+
+  private setActiveThread(guildId: string, userId: string, displayName: string): void {
+    let byUser = this.activeThreadByGuild.get(guildId);
+    if (!byUser) {
+      byUser = new Map();
+      this.activeThreadByGuild.set(guildId, byUser);
+    }
+    byUser.set(userId, { displayName, expiresAt: Date.now() + ACTIVE_THREAD_TTL_MS });
+  }
+
+  /**
+   * Returns the continuation payload for `TurnCandidate.activeThreadContinuation`
+   * if `userId` has a still-open active-thread window in this guild, else
+   * `undefined`. Lazily expires (and removes) a stale entry on read rather
+   * than running a separate sweep timer — mirrors `expireStaleEngagementIfNeeded`'s
+   * "checked opportunistically, not worth a dedicated background timer"
+   * philosophy for this kind of short-TTL, best-effort state.
+   *
+   * `contextHint` tuned (Merry, conversation-continuity wiring pass) to match
+   * the established style of the other system-event hints in this file
+   * (`announceSessionStart`, `handleMemberJoinedVoice`) — name what just
+   * happened, then give concrete do/don't instructions, rather than a single
+   * generic "keep engaging" line. Concretely: told to treat this as a direct
+   * reply (not a fresh ambient comment), stay on the SAME thread rather than
+   * pivoting to something generic, and never ask the person to repeat
+   * themselves or clarify who they're addressing — the model has no other
+   * signal that this is a continuation besides this hint, so it needs to be
+   * unambiguous, not just descriptive.
+   */
+  private getActiveThreadContinuation(guildId: string, userId: string): TurnCandidate["activeThreadContinuation"] {
+    const byUser = this.activeThreadByGuild.get(guildId);
+    const entry = byUser?.get(userId);
+    if (!entry) return undefined;
+    if (Date.now() > entry.expiresAt) {
+      byUser!.delete(userId);
+      return undefined;
+    }
+    return {
+      withUserId: userId,
+      contextHint: `${entry.displayName} just said this without using your name — but it directly continues a conversation you (the bot) started with them moments ago, so treat it exactly like a direct reply to you, not a fresh ambient comment. Engage specifically with what they just said, stay on the same thread/topic rather than pivoting to something generic, and never ask them to repeat themselves or clarify who they're talking to.`,
+    };
   }
 
   /**

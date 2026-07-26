@@ -11,6 +11,8 @@ import type {
   UsageLogEntry,
   UsageService,
   TurnOutcome,
+  TurnOutcomeCategory,
+  EngagementBucket,
 } from "./types";
 import type { BotMode } from "../config/types";
 
@@ -51,6 +53,7 @@ interface GuildSettingsRow {
   allow_ambient_barge_in: boolean;
   voice_id: string | null;
   consent_channel_id: string | null;
+  max_explicit_responses_per_minute: number | null;
   updated_at: number;
 }
 
@@ -241,13 +244,14 @@ export class PostgresMemoryStore implements MemoryStore {
       allowAmbientBargeIn: patch.allowAmbientBargeIn ?? current?.allowAmbientBargeIn ?? this.defaults.allowAmbientBargeIn,
       voiceId: patch.voiceId ?? current?.voiceId,
       consentChannelId: patch.consentChannelId ?? current?.consentChannelId,
+      maxExplicitResponsesPerMinute: patch.maxExplicitResponsesPerMinute ?? current?.maxExplicitResponsesPerMinute,
       updatedAt: Date.now(),
     };
 
     await this.pool.query(
       `INSERT INTO guild_settings
-        (guild_id, mode, max_responses_per_minute, min_gap_seconds, stt_confidence_threshold, allow_ambient_barge_in, voice_id, consent_channel_id, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        (guild_id, mode, max_responses_per_minute, min_gap_seconds, stt_confidence_threshold, allow_ambient_barge_in, voice_id, consent_channel_id, max_explicit_responses_per_minute, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (guild_id) DO UPDATE SET
          mode = excluded.mode,
          max_responses_per_minute = excluded.max_responses_per_minute,
@@ -256,6 +260,7 @@ export class PostgresMemoryStore implements MemoryStore {
          allow_ambient_barge_in = excluded.allow_ambient_barge_in,
          voice_id = excluded.voice_id,
          consent_channel_id = excluded.consent_channel_id,
+         max_explicit_responses_per_minute = excluded.max_explicit_responses_per_minute,
          updated_at = excluded.updated_at`,
       [
         merged.guildId,
@@ -266,6 +271,7 @@ export class PostgresMemoryStore implements MemoryStore {
         merged.allowAmbientBargeIn,
         merged.voiceId ?? null,
         merged.consentChannelId ?? null,
+        merged.maxExplicitResponsesPerMinute ?? null,
         merged.updatedAt,
       ],
     );
@@ -324,43 +330,57 @@ export class PostgresMemoryStore implements MemoryStore {
     return usage;
   }
 
-  async recordTurnOutcome(guildId: string, outcome: TurnOutcome, occurredAt: number): Promise<void> {
+  async recordTurnOutcome(guildId: string, outcome: TurnOutcome, occurredAt: number, category: TurnOutcomeCategory): Promise<void> {
     await this.ready;
     await this.pool.query(
-      `INSERT INTO turn_outcomes (guild_id, outcome, occurred_at) VALUES ($1, $2, $3)`,
-      [guildId, outcome, occurredAt],
+      `INSERT INTO turn_outcomes (guild_id, outcome, category, occurred_at) VALUES ($1, $2, $3, $4)`,
+      [guildId, outcome, category, occurredAt],
     );
     // Retention: cap enforced at the write site (see schema.ts's turn_outcomes
     // comment) — keep only the newest MAX_ENGAGEMENT_OUTCOMES_PER_GUILD rows
-    // for this guild, same semantics as frodo's original in-process ring
-    // buffer, just ported to a real DELETE instead of an array splice.
+    // PER (guild, category) now (conversation-continuity round), same
+    // semantics as frodo's original in-process ring buffer, just ported to a
+    // real DELETE instead of an array splice, and scoped per-category so one
+    // noisy category (e.g. frequent ambient chatter) can't evict another's
+    // (e.g. rarer interjection) history.
     await this.pool.query(
       `DELETE FROM turn_outcomes
        WHERE guild_id = $1
+         AND category = $2
          AND id NOT IN (
-           SELECT id FROM turn_outcomes WHERE guild_id = $1 ORDER BY occurred_at DESC LIMIT $2
+           SELECT id FROM turn_outcomes WHERE guild_id = $1 AND category = $2 ORDER BY occurred_at DESC LIMIT $3
          )`,
-      [guildId, MAX_ENGAGEMENT_OUTCOMES_PER_GUILD],
+      [guildId, category, MAX_ENGAGEMENT_OUTCOMES_PER_GUILD],
     );
   }
 
-  async getRecentEngagementStats(guildId: string): Promise<{ landed: number; flopped: number }> {
+  async getRecentEngagementStats(
+    guildId: string,
+  ): Promise<{ overall: EngagementBucket; byCategory: Partial<Record<TurnOutcomeCategory, EngagementBucket>> }> {
     await this.ready;
     // LIMIT here is defense-in-depth, not the primary bound (recordTurnOutcome's
     // DELETE already keeps this table at <= MAX_ENGAGEMENT_OUTCOMES_PER_GUILD
-    // rows per guild) — cheap insurance against reading a stale/over-grown
-    // set if a prune ever fails to run.
-    const result = await this.pool.query<{ outcome: TurnOutcome }>(
-      `SELECT outcome FROM turn_outcomes WHERE guild_id = $1 ORDER BY occurred_at DESC LIMIT $2`,
-      [guildId, MAX_ENGAGEMENT_OUTCOMES_PER_GUILD],
+    // rows per (guild, category)) — cheap insurance against reading a
+    // stale/over-grown set if a prune ever fails to run. Bound is now
+    // multiplied by the number of categories (4) since retention is
+    // per-category, not per-guild, as of this round.
+    const result = await this.pool.query<{ outcome: TurnOutcome; category: TurnOutcomeCategory }>(
+      `SELECT outcome, category FROM turn_outcomes WHERE guild_id = $1 ORDER BY occurred_at DESC LIMIT $2`,
+      [guildId, MAX_ENGAGEMENT_OUTCOMES_PER_GUILD * 4],
     );
-    let landed = 0;
-    let flopped = 0;
+    const overall: EngagementBucket = { landed: 0, flopped: 0 };
+    const byCategory: Partial<Record<TurnOutcomeCategory, EngagementBucket>> = {};
     for (const row of result.rows) {
-      if (row.outcome === "landed") landed++;
-      else flopped++;
+      const bucket = byCategory[row.category] ?? (byCategory[row.category] = { landed: 0, flopped: 0 });
+      if (row.outcome === "landed") {
+        overall.landed++;
+        bucket.landed++;
+      } else {
+        overall.flopped++;
+        bucket.flopped++;
+      }
     }
-    return { landed, flopped };
+    return { overall, byCategory };
   }
 
   async close(): Promise<void> {
@@ -394,6 +414,7 @@ function rowToSettings(row: GuildSettingsRow): GuildSettings {
     allowAmbientBargeIn: row.allow_ambient_barge_in,
     voiceId: row.voice_id ?? undefined,
     consentChannelId: row.consent_channel_id ?? undefined,
+    maxExplicitResponsesPerMinute: row.max_explicit_responses_per_minute ?? undefined,
     updatedAt: row.updated_at,
   };
 }

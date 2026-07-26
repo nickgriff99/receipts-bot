@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { TranscriptSegmentSchema } from "../stt/types";
+import { TurnOutcomeCategorySchema } from "../memory/types";
 
 /**
  * Pipeline module boundary — turn-taking/trigger logic.
@@ -81,6 +82,28 @@ export const TurnCandidateSchema = z.object({
    * field was needed on the LLM contract itself to carry per-event context.
    */
   contextHint: z.string().optional(),
+  /**
+   * Conversation-continuity round (frodo, task 1) — set by
+   * `PipelineOrchestrator` (which owns `activeThreadByGuild`, the code-level
+   * "bot is mid-conversation with this specific person" tracker) when an
+   * incoming `ambient_pause` candidate's `triggeringUserId` matches a
+   * still-open thread. Deliberately modeled as a flag/hint on the EXISTING
+   * `ambient_pause` trigger type rather than a new `TriggerType` — the
+   * candidate really is still just an ambient VAD-closed utterance from a
+   * turn-taking-mechanics standpoint (no new bypass-the-natural-pause
+   * behavior), it just carries extra code-level evidence about WHO it's
+   * from. `TurnTakingEngine.decide` treats its presence as at least as
+   * reliable as an explicit trigger — see that method's doc comment.
+   * `undefined` for every trigger type except `ambient_pause`, and for
+   * `ambient_pause` candidates with no open thread for that speaker.
+   */
+  activeThreadContinuation: z
+    .object({
+      withUserId: z.string().min(1),
+      /** Free-text reason, same `contextHint`-into-`LLMRequest.triggerReason` pattern as the social-presence round's system-event turns. */
+      contextHint: z.string().min(1),
+    })
+    .optional(),
 });
 export type TurnCandidate = z.infer<typeof TurnCandidateSchema>;
 
@@ -141,15 +164,25 @@ export const TurnDecisionSchema = z.object({
   /** Whether the haiku cheap-gate call was actually made for this candidate (always false for explicit triggers). */
   cheapGateUsed: z.boolean(),
   decidedAt: z.number().int().nonnegative(),
+  /**
+   * Conversation-continuity round (frodo, task 6) — which
+   * `TurnOutcomeCategory` this decision belongs to, for
+   * `PipelineOrchestrator` to tag the engagement window it opens (if any)
+   * with. `undefined` for explicit triggers and system events (member
+   * joined/left, session start) — same "not a timing judgment, don't track
+   * it" set `TurnOutcomeCategorySchema`'s doc comment describes.
+   */
+  category: TurnOutcomeCategorySchema.optional(),
 });
 export type TurnDecision = z.infer<typeof TurnDecisionSchema>;
 
 export interface RateLimiter {
   /**
-   * @param bypassCooldown - true for explicit triggers: still enforces the
-   *   per-minute cap, but ignores the min-gap-seconds cooldown (brief
-   *   section 3: "explicit-address triggers can bypass part of this
-   *   cooldown").
+   * @param bypassCooldown - true for explicit triggers (and, as of the
+   *   conversation-continuity round, active-thread continuations — see
+   *   `TurnCandidate.activeThreadContinuation`): still enforces a per-minute
+   *   cap, but ignores the min-gap-seconds cooldown (brief section 3:
+   *   "explicit-address triggers can bypass part of this cooldown").
    *
    * Async (Gollum, Postgres migration round): `InMemoryRateLimiter`'s
    * `configFor` callback reads per-guild `maxResponsesPerMinute`/
@@ -158,10 +191,31 @@ export interface RateLimiter {
    * limiter's own sliding-window state is still pure in-memory logic.
    */
   canRespond(guildId: string, opts: { bypassCooldown: boolean }): Promise<boolean>;
-  recordResponse(guildId: string): void;
+  /**
+   * @param opts.bypassCooldown - must match the value passed to the
+   *   `canRespond` call that approved this response (task 2 fix,
+   *   conversation-continuity round) — routes the timestamp into the
+   *   correct sliding window (see `RateLimiterConfig.maxExplicitResponsesPerMinute`'s
+   *   doc comment for why bypass-class responses get their own bucket).
+   */
+  recordResponse(guildId: string, opts: { bypassCooldown: boolean }): void;
 }
 
 export interface RateLimiterConfig {
   maxResponsesPerMinute: number;
   minGapSeconds: number;
+  /**
+   * Task 2 fix (conversation-continuity round): a SEPARATE per-minute cap
+   * just for bypassCooldown-class responses (explicit triggers + active-
+   * thread continuations), investigated as a possible cause of "isn't
+   * consistently talking when directly addressed" — a burst of
+   * ambient/proactive replies earlier in the same 60s window sharing ONE
+   * cap with explicit-address replies could in principle silently swallow a
+   * legitimate direct-address turn. Optional/additive: `undefined` (until
+   * Sam wires a real `GuildSettings`/env column for it) means "not
+   * configured for this guild" and falls back to the exact pre-existing
+   * behavior of sharing one combined cap across every response class —
+   * zero behavior change until a deployment actually sets this.
+   */
+  maxExplicitResponsesPerMinute?: number;
 }

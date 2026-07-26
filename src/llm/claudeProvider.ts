@@ -67,39 +67,11 @@ export class ClaudeHaikuProvider implements LLMProvider {
 
   async cheapGateCheck(input: CheapGateInput): Promise<CheapGateResult> {
     const transcriptText = formatTranscript(input.recentTranscript);
-    const system = [
-      // Rebalanced (frodo, proactive-chime round): the prior version
-      // defaulted strongly to YES for almost everything, which was the
-      // likely root cause of "talks when it isn't addressed / talks too
-      // much" — this call is also now shared by ambient-pause AND
-      // timer-driven proactive candidates (pipeline/turnTaking.ts), so an
-      // unconditional yes-bias would be even more likely to fire into
-      // low-content moments. Direct-address handling below is deliberately
-      // KEPT strongly yes-biased — that's a different failure mode
-      // (under-triggering when clearly addressed) and must not regress.
-      `You are the response gate for "${input.persona.name}", a witty Discord voice co-host who banters, reacts,`,
-      "asks questions, and comments on the conversation — but only when it actually adds something in the moment.",
-      "Given the most recent snippet of live voice-chat transcript, decide whether the bot should speak RIGHT NOW.",
-      "Say YES when: someone is directly addressing the bot (see DIRECT ADDRESS below — always yes there); a joke or",
-      "strong reaction opportunity just landed; someone asked the group a question worth answering; or the",
-      "conversation moved to a fresh topic worth a genuine comment. Say NO when: nothing new has happened since the",
-      "bot's own last line; the snippet is low-content filler (short acknowledgements, half a sentence, background",
-      "noise transcribed as words) with nothing to actually react to; jumping in would clearly talk over someone",
-      "still mid-sentence; or the moment is genuinely serious/sensitive and a quip would land badly. When it's a",
-      "genuinely close call between a real reaction and staying quiet, prefer staying quiet — this bot should feel",
-      "like an attentive participant who picks real moments, not a chatbot replying to every line.",
-      `DIRECT ADDRESS: people often talk to the bot WITHOUT using its name — with "you" ("what do you think?", "you`,
-      `agree?"), or by referring to it as "him"/"it"/"this guy" ("ask him", "what's it say", "tell this guy"). Use the`,
-      `conversation flow to judge who is being addressed — the bot's own recent lines are labeled "${input.persona.name}:",`,
-      "so a question right after it spoke, or a reply to something it said, is almost certainly aimed at it. If someone is",
-      "clearly talking TO the bot — by name OR by pronoun in context — that is ALWAYS a yes, even mid-serious-moment. But",
-      "if a pronoun clearly refers to another real person and the humans are talking among themselves, don't assume it",
-      "means the bot.",
-      `IMPORTANT: the bot's own recent lines appear in the transcript labeled "${input.persona.name}:". Say NO if the`,
-      "bot would just be repeating a point it already made or beating a topic it has already reacted to — in that case",
-      "let the conversation move on and wait for something new. Prefer chiming in on the newest thing being said.",
-      'Reply with ONLY compact JSON: {"respond": boolean, "reason": "one short phrase"}. No other text.',
-    ].join(" ");
+    const checkKind = input.checkKind ?? "ambient";
+    const system =
+      checkKind === "interjection"
+        ? buildInterjectionGateSystemPrompt(input.persona.name)
+        : buildAmbientGateSystemPrompt(input.persona.name);
 
     const userContent = transcriptText.length > 0 ? transcriptText : "(no recent transcript)";
 
@@ -254,6 +226,102 @@ export class ClaudeHaikuProvider implements LLMProvider {
       return { newFacts: [], usage: { inputTokens: 0, outputTokens: 0 } };
     }
   }
+}
+
+/**
+ * Ambient cheap-gate system prompt — pre-existing behavior, unchanged from
+ * before this round, just extracted into a named function so
+ * `cheapGateCheck` can pick between it and the new interjection variant
+ * below (task 5, conversation-continuity round). Rebalanced (frodo,
+ * proactive-chime round): the prior version defaulted strongly to YES for
+ * almost everything, which was the likely root cause of "talks when it
+ * isn't addressed / talks too much" — this call is also shared by
+ * ambient-pause AND timer-driven proactive candidates
+ * (pipeline/turnTaking.ts), so an unconditional yes-bias would be even more
+ * likely to fire into low-content moments. Direct-address handling below is
+ * deliberately KEPT strongly yes-biased — that's a different failure mode
+ * (under-triggering when clearly addressed) and must not regress. Note:
+ * as of the conversation-continuity round, the strongest form of
+ * direct-address reliability (a reply to the bot's own last line, from the
+ * SAME person it was just talking to) is handled structurally upstream by
+ * `TurnTakingEngine`'s active-thread continuation check — that path skips
+ * this gate call entirely, so this prompt no longer needs to be the only
+ * thing carrying that specific case.
+ */
+function buildAmbientGateSystemPrompt(personaName: string): string {
+  return [
+    `You are the response gate for "${personaName}", a witty Discord voice co-host who banters, reacts,`,
+    "asks questions, and comments on the conversation — but only when it actually adds something in the moment.",
+    "Given the most recent snippet of live voice-chat transcript, decide whether the bot should speak RIGHT NOW.",
+    "Say YES when: someone is directly addressing the bot (see DIRECT ADDRESS below — always yes there); a joke or",
+    "strong reaction opportunity just landed; someone asked the group a question worth answering; or the",
+    "conversation moved to a fresh topic worth a genuine comment. Say NO when: nothing new has happened since the",
+    "bot's own last line; the snippet is low-content filler (short acknowledgements, half a sentence, background",
+    "noise transcribed as words) with nothing to actually react to; jumping in would clearly talk over someone",
+    "still mid-sentence; or the moment is genuinely serious/sensitive and a quip would land badly. When it's a",
+    "genuinely close call between a real reaction and staying quiet, prefer staying quiet — this bot should feel",
+    "like an attentive participant who picks real moments, not a chatbot replying to every line.",
+    `DIRECT ADDRESS: people often talk to the bot WITHOUT using its name — with "you" ("what do you think?", "you`,
+    `agree?"), or by referring to it as "him"/"it"/"this guy" ("ask him", "what's it say", "tell this guy"). Use the`,
+    `conversation flow to judge who is being addressed — the bot's own recent lines are labeled "${personaName}:",`,
+    "so a question right after it spoke, or a reply to something it said, is almost certainly aimed at it. If someone is",
+    "clearly talking TO the bot — by name OR by pronoun in context — that is ALWAYS a yes, even mid-serious-moment. But",
+    "if a pronoun clearly refers to another real person and the humans are talking among themselves, don't assume it",
+    "means the bot.",
+    `IMPORTANT: the bot's own recent lines appear in the transcript labeled "${personaName}:". Say NO if the`,
+    "bot would just be repeating a point it already made or beating a topic it has already reacted to — in that case",
+    "let the conversation move on and wait for something new. Prefer chiming in on the newest thing being said.",
+    'Reply with ONLY compact JSON: {"respond": boolean, "reason": "one short phrase"}. No other text.',
+  ].join(" ");
+}
+
+/**
+ * Quick-gap interjection gate (task 5, conversation-continuity round) — a
+ * DISTINCT, deliberately rarer/higher-bar check than the ambient gate
+ * above. `TurnTakingEngine.decideInterjection` only calls this after the
+ * ambient gate has already said no (or was itself damped by the engagement
+ * signal) for the exact same candidate — this is the bot's second, much
+ * choosier chance to speak into the same pause, not an easier path to the
+ * same yes. Never asked to weigh in on direct address at all (that's
+ * already fully covered upstream — explicit triggers and active-thread
+ * continuations never even reach either gate) — this prompt is purely about
+ * "is this specific ambient moment special enough to interrupt the quiet
+ * for", independent of who's being talked to.
+ *
+ * Tuned (Merry, conversation-continuity round, wiring pass): the first draft
+ * conveyed "higher bar" but had no explicit recency requirement — nothing
+ * stopped it saying YES to a funny moment from several exchanges back that
+ * the conversation had already moved past. Added a dedicated RECENCY clause
+ * (must react to the newest line or two, not resurrect something stale) plus
+ * an explicit "on the fence -> NO" tie-breaker to push the calibration
+ * further toward rare. Everything else (higher-bar framing, direct-address
+ * carve-out, mid-sentence guard mirrored from the ambient gate per this
+ * project's documented redundant-check precedent) is unchanged from the
+ * first draft.
+ */
+function buildInterjectionGateSystemPrompt(personaName: string): string {
+  return [
+    `You are a SECOND, much stricter gate for "${personaName}", a witty Discord voice co-host. The ordinary`,
+    "response gate already looked at this exact moment and said NOT to speak (or was skipped entirely because the",
+    "conversation has been flat lately). You get one narrow, rare exception: say YES only if THIS SPECIFIC pause is",
+    "genuinely special enough that staying quiet would be a missed opportunity — something unusually funny just",
+    "happened, something random and delightful worth a quick reaction, or something clearly important enough (a real",
+    "question hanging unanswered, a notable moment) that it deserves a comment even though it's not the bot's",
+    "ordinary turn to speak. This is a MUCH higher bar than the normal gate, not a second roll of the same dice —",
+    "most pauses, even ones with something mildly worth adding, should still get a NO here. Reserve YES for moments",
+    "that would feel like a genuinely missed beat if the bot said nothing. If you're on the fence at all, the answer",
+    "is NO.",
+    "RECENCY: only say YES if you're reacting to something that JUST happened — the newest line or two of the",
+    "transcript. If the funny/notable moment already passed a few exchanges ago and the conversation has since moved",
+    "on to something else, that moment is stale now — say NO, even if it was genuinely a good one at the time. The",
+    "whole point of this check is feeling snappy in the gap right after something lands, not resurrecting an old",
+    "moment.",
+    "Say NO whenever: the moment is merely fine/pleasant/ordinary; it's simply more small talk or filler; the",
+    "notable thing isn't the most recent thing said; you're not confident it's genuinely worth interrupting the",
+    "quiet for; or jumping in would clearly talk over someone still mid-sentence. This check has nothing to do with",
+    "whether the bot is being addressed — that is handled elsewhere and is never the reason to say yes here.",
+    'Reply with ONLY compact JSON: {"respond": boolean, "reason": "one short phrase"}. No other text.',
+  ].join(" ");
 }
 
 /** Pull the concatenated text out of an Anthropic `messages.create` response's content blocks. */

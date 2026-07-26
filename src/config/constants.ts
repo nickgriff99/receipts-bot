@@ -76,3 +76,49 @@ export const MAX_ENGAGEMENT_OUTCOMES_PER_GUILD = 40;
  * short-term anti-repetition nudge, not a style-preference profile.
  */
 export const MAX_RECENT_TONES_PER_GUILD = 4;
+
+/**
+ * Conversation-continuity round (frodo, brief section 1/task 1): how long
+ * after the bot speaks TO a specific person (`PipelineOrchestrator`'s
+ * `activeThreadByGuild`) that person's next `ambient_pause` segment is
+ * treated as at least as reliable as an explicit trigger, skipping the
+ * cheap gate entirely.
+ *
+ * Picked 75s as the midpoint of the brief's suggested 60-90s starting band:
+ * long enough to cover a real person pausing to think/type/gesture before
+ * replying (a plain "yes" 20s later shouldn't have to re-say the bot's
+ * name), short enough that an unrelated thing that same person says a
+ * few minutes later — after the conversation has genuinely moved on — does
+ * NOT get grandfathered in as "still talking to the bot". Not exposed as an
+ * env-tunable config knob this round (same "implementation heuristic, not a
+ * stakeholder-tunable value" call as `PROACTIVE_ACTIVITY_LOOKBACK_MS` in
+ * turnTaking.ts) — revisit if live testing shows the window is
+ * mistimed either direction.
+ */
+export const ACTIVE_THREAD_TTL_MS = 75_000;
+
+/**
+ * Conversation-continuity round (frodo, task 5 — quick-gap interjection):
+ * minimum seconds between INTERJECTION-CHECK attempts per guild (not just
+ * successes), mirroring `TurnTakingEngine`'s existing
+ * `lastProactiveAttemptAt` pattern for the proactive path. Deliberately much
+ * shorter than the proactive cadence floor (~2-3min) — brief: "decoupled...
+ * from waiting for the proactive timer's cadence floor" — but still bounds
+ * the extra cheap-gate-call cost of trying an interjection every single time
+ * the generic ambient gate says no, which would otherwise roughly double
+ * cheap-gate call volume during any quiet-ish stretch.
+ */
+export const INTERJECTION_MIN_INTERVAL_SECONDS = 30;
+
+/**
+ * Organic-cadence round (frodo, task 4): jitter band applied as a
+ * multiplier on the (possibly engagement-rescaled) proactive interval floor
+ * so consecutive proactive gaps stop feeling like a metronome. Centered
+ * slightly above 1.0 (not symmetric around it) because the owner also asked
+ * the bot to generally feel a bit more willing to speak up rather than
+ * ultra-rare — see `PROACTIVE_JITTER_MIN_MULTIPLIER`'s doc note in
+ * turnTaking.ts for why jitter has to live in the cadence-floor check rather
+ * than the fixed-tick timer that drives it.
+ */
+export const PROACTIVE_JITTER_MIN_MULTIPLIER = 0.75;
+export const PROACTIVE_JITTER_MAX_MULTIPLIER = 1.5;

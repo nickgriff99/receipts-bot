@@ -196,6 +196,27 @@ export const CheapGateInputSchema = z.object({
   persona: PersonaConfigSchema,
   /** Short recent window — this call is deliberately token-thin, it does NOT get the full memory context. */
   recentTranscript: z.array(TranscriptSegmentSchema),
+  /**
+   * Conversation-continuity round (frodo, task 5) — which gate prompt
+   * variant to run. `"ambient"` (the default, and every existing call site
+   * before this round) is the pre-existing "does this add something worth
+   * saying" check. `"interjection"` is a distinct, rarer, higher-bar
+   * "is THIS SPECIFIC pause strongly worth jumping into" check
+   * (`TurnTakingEngine.decideInterjection`) that can fire even after the
+   * ambient variant already said no for the same candidate — see that
+   * method's doc comment. Kept as one shared method + a discriminator field
+   * rather than a second `LLMProvider` method: same request/response shape,
+   * same token-thin transcript-only context, only the system prompt differs
+   * — a whole parallel interface would just duplicate the usage-logging and
+   * lenient-parse plumbing around it for no real benefit.
+   *
+   * `.optional()`, not `.default("ambient")`: this schema is also used as a
+   * plain TypeScript type at call sites that build the object literal
+   * directly (never call `.parse()`), so a Zod-level default would still
+   * leave the field required at the TYPE level. `ClaudeHaikuProvider`
+   * resolves the default itself (`input.checkKind ?? "ambient"`).
+   */
+  checkKind: z.enum(["ambient", "interjection"]).optional(),
 });
 export type CheapGateInput = z.infer<typeof CheapGateInputSchema>;
 
