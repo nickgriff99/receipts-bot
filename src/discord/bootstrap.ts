@@ -346,9 +346,32 @@ export class DiscordBotRuntime {
     connection.receiver.speaking.on("start", speakingListener);
 
     if (textChannelId) {
-      await this.postConsentNotice(guild, textChannelId).catch((err) => {
-        log.warn("failed to post consent notice", { guildId, error: err instanceof Error ? err.message : String(err) });
-      });
+      // Only post the consent notice if someone currently in the voice channel
+      // still needs to accept. Consent is persisted per-user in Postgres
+      // (user_profiles.consent_accepted) and survives bot rejoins/restarts, so
+      // re-posting the full "click Accept" message on every join when everyone
+      // present already accepted just nags people and made them think their
+      // earlier acceptance didn't stick. If we can't read channel membership,
+      // default to posting so we never silently skip collecting real consent.
+      let needsConsentPrompt = true;
+      if (voiceChannel && voiceChannel.isVoiceBased()) {
+        const humans = voiceChannel.members.filter((m) => !m.user.bot);
+        needsConsentPrompt = false;
+        for (const member of humans.values()) {
+          if (!(await this.deps.memory.hasAcceptedConsent(guildId, member.id))) {
+            needsConsentPrompt = true;
+            break;
+          }
+        }
+      }
+
+      if (needsConsentPrompt) {
+        await this.postConsentNotice(guild, textChannelId).catch((err) => {
+          log.warn("failed to post consent notice", { guildId, error: err instanceof Error ? err.message : String(err) });
+        });
+      } else {
+        log.info("skipping consent notice — all present users already accepted", { guildId });
+      }
     } else {
       log.warn("no sendable text channel found — skipping consent notice", { guildId });
     }

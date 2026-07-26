@@ -147,6 +147,18 @@ export class PipelineOrchestrator {
     }
 
     if (queue.running) {
+      // An already-queued explicit mention outranks an incoming ambient
+      // segment — don't let it get silently clobbered before drain gets to
+      // it (bugs/nazgul round: explicit name/pronoun mentions were being
+      // dropped by the very next unrelated segment, well before
+      // turnTaking.decide() ever saw them). Ambient-vs-ambient and
+      // mention-vs-mention (or mention superseding a pending ambient) keep
+      // the existing newest-wins behavior — only pending-mention vs.
+      // incoming-ambient is special-cased.
+      if (queue.pending && isExplicitTrigger(queue.pending.triggerType) && !isExplicitTrigger(triggerType)) {
+        log.debug("rejecting incoming ambient segment — explicit mention already queued", { guildId });
+        return;
+      }
       if (queue.pending) {
         log.debug("dropping stale queued turn — superseded by newer segment", { guildId });
       }
