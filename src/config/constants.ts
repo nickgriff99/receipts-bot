@@ -33,6 +33,15 @@ export const DEFAULT_MAX_RESPONSE_SENTENCES = 3;
 export const LATENCY_WARN_THRESHOLD_MS = 2500;
 
 /**
+ * Defense-in-depth bound on `playback.play()`'s await in `orchestrator.ts`'s
+ * `runTurn` — a hang in playback (any cause) must not permanently deadlock a
+ * guild's serialized turn queue (`drainTurnQueue` awaits turns one at a
+ * time). Generous relative to any real TTS clip length; only exists to cap
+ * the worst case, not to interrupt normal playback.
+ */
+export const PLAYBACK_AWAIT_TIMEOUT_MS = 30_000;
+
+/**
  * Memory schema lock (Sam): `facts`/`running_jokes` stay JSON-encoded TEXT
  * columns (see memory/schema.ts for the tradeoff writeup), NOT normalized
  * child tables. Since that means the whole array round-trips on every

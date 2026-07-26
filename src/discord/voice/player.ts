@@ -28,7 +28,14 @@ export class DiscordPlaybackController implements PlaybackController {
   /** Merry: call once per guild after `VoiceSessionManager.join()` succeeds. */
   attach(guildId: string, connection: VoiceConnection): AudioPlayer {
     const existing = this.guildStates.get(guildId);
-    if (existing) return existing.player;
+    if (existing) {
+      // Reused player from a prior join/leave cycle — its old subscription
+      // died with the old (destroyed) VoiceConnection. Without this, the
+      // player has zero subscribers, defaults to noSubscriber: "pause", and
+      // silently never reaches Idle — see player.ts bug writeup.
+      connection.subscribe(existing.player);
+      return existing.player;
+    }
 
     const player = createAudioPlayer();
     connection.subscribe(player);

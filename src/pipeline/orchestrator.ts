@@ -8,7 +8,7 @@ import type { TriggerType, TurnCandidate } from "./types";
 import { isExplicitTrigger, PROACTIVE_TRIGGER_USER_ID, SESSION_START_TRIGGER_USER_ID } from "./types";
 import { TurnTakingEngine } from "./turnTaking";
 import { ContextAssembler } from "./contextAssembler";
-import { BOT_SPEAKER_ID, CONTEXT_WINDOW_UTTERANCES, LATENCY_WARN_THRESHOLD_MS, MAX_RECENT_TONES_PER_GUILD } from "../config/constants";
+import { BOT_SPEAKER_ID, CONTEXT_WINDOW_UTTERANCES, LATENCY_WARN_THRESHOLD_MS, MAX_RECENT_TONES_PER_GUILD, PLAYBACK_AWAIT_TIMEOUT_MS } from "../config/constants";
 import { logger } from "../shared/logger";
 
 const log = logger.child("pipeline:orchestrator");
@@ -582,7 +582,17 @@ export class PipelineOrchestrator {
         tone: response.tone,
         voiceId: this.deps.voiceId,
       });
-      await this.deps.playback.play(item.guildId, ttsStream, { priority });
+      // Bounded — a hang here must not permanently wedge the guild's
+      // serialized turn queue (drainTurnQueue awaits turns one at a time).
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("playback timed out")), PLAYBACK_AWAIT_TIMEOUT_MS);
+      });
+      try {
+        await Promise.race([this.deps.playback.play(item.guildId, ttsStream, { priority }), timeout]);
+      } finally {
+        clearTimeout(timer);
+      }
     } catch (err) {
       log.error("TTS/playback failed — continuing without spoken reply", {
         guildId: item.guildId,
