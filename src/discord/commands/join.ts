@@ -16,9 +16,10 @@ export const joinCommand: SlashCommandDefinition = {
     }
     try {
       await ctx.services.startVoicePipeline(ctx.guildId, ctx.voiceChannelId);
-      await ctx.reply("Joined — listening now. Voice is transcribed and used for responses + memory (see the consent notice above).");
     } catch (err) {
       await ctx.reply(`Couldn't join that channel: ${err instanceof Error ? err.message : String(err)}`);
+      return;
     }
+    await ctx.reply("Joined — listening now. Voice is transcribed and used for responses + memory (see the consent notice above).");
   },
 };

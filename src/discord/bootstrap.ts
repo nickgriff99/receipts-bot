@@ -213,6 +213,13 @@ export class DiscordBotRuntime {
       return;
     }
 
+    // Deferred immediately, before any guild/member REST lookups below —
+    // Discord invalidates an interaction token ~3s after receipt, and the
+    // `guilds.fetch`/`members.fetch` fallbacks plus command handlers' own DB
+    // calls can easily push a first `reply()` past that window ("Unknown
+    // interaction"). `ctx.reply` below always edits the deferred reply.
+    await interaction.deferReply();
+
     const guild = interaction.guild ?? (await this.deps.client.guilds.fetch(interaction.guildId));
     const member = guild.members.cache.get(interaction.user.id) ?? (await guild.members.fetch(interaction.user.id).catch(() => undefined));
 
@@ -233,11 +240,7 @@ export class DiscordBotRuntime {
       options,
       services: this.services,
       reply: async (content: string) => {
-        if (interaction.deferred || interaction.replied) {
-          await interaction.editReply(content);
-        } else {
-          await interaction.reply(content);
-        }
+        await interaction.editReply(content);
       },
     };
 
@@ -258,10 +261,15 @@ export class DiscordBotRuntime {
       return;
     }
 
+    // Deferred before the `setConsentAccepted` DB write — same "Unknown
+    // interaction" risk as `dispatchCommand`. This sends a new ephemeral
+    // reply (not editing the original consent-notice message), so
+    // `deferReply`, not `deferUpdate`.
+    await interaction.deferReply({ ephemeral: true });
+
     await this.deps.memory.setConsentAccepted(interaction.guildId, interaction.user.id, true);
-    await interaction.reply({
+    await interaction.editReply({
       content: "You're all set — I'll start listening and responding to you in voice now.",
-      ephemeral: true,
     });
   }
 
