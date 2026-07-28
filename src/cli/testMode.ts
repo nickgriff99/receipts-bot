@@ -90,6 +90,7 @@ async function main(): Promise<void> {
     memoryContext: [],
     triggerReason: "cli explicit test input",
     recentTones: [], // no per-guild history in the standalone CLI smoke test
+    guildRunningJokes: [], // no Postgres/guild memory in the standalone CLI smoke test
   });
 
   console.log(`\nBot text: ${response.text}`);

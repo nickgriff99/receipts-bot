@@ -7,6 +7,8 @@ import { activeCommand } from "./active";
 import { optoutCommand } from "./optout";
 import { optinCommand } from "./optin";
 import { setConsentChannelCommand } from "./setConsentChannel";
+import { setContextCommand } from "./setContext";
+import { clearContextCommand } from "./clearContext";
 
 /**
  * Command registry — `discord/bootstrap.ts` hooks this up to discord.js's
@@ -27,4 +29,6 @@ export const COMMANDS: SlashCommandDefinition[] = [
   optoutCommand,
   optinCommand,
   setConsentChannelCommand,
+  setContextCommand,
+  clearContextCommand,
 ];

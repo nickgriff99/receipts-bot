@@ -7,9 +7,18 @@ import type {
   CheapGateResult,
   MemoryExtractionInput,
   MemoryExtractionResult,
+  GuildJokeExtractionInput,
+  GuildJokeExtractionResult,
 } from "./types";
-import { parseLLMReply, parseCheapGateReply, parseMemoryExtractionReply } from "./types";
+import {
+  parseLLMReply,
+  parseCheapGateReply,
+  parseMemoryExtractionReply,
+  parseGuildJokeExtractionReply,
+} from "./types";
+import { sanitizeSpokenText } from "./sanitize";
 import { logger } from "../shared/logger";
+import { LLM_GENERATE_TIMEOUT_MS, WEB_SEARCH_MAX_USES_PER_TURN } from "../config/constants";
 
 const log = logger.child("llm:claude");
 
@@ -55,14 +64,28 @@ const RESPONSE_STYLE_MODES = [
  * MemoryStore dependency by design (keeps the LLM/memory module boundary
  * clean, see ARCHITECTURE.md).
  */
+export interface ClaudeHaikuProviderOptions {
+  /**
+   * Web-lookup round (frodo, task 3) — master on/off switch for Claude's
+   * native `web_search` server tool in `generateResponse`, mirroring
+   * `AppConfig.defaults.proactiveChimeEnabled`'s "independent kill switch"
+   * precedent. Defaults to `true` (owner confirmed adding this feature) —
+   * pass `false` (wired from `DEFAULT_WEB_SEARCH_ENABLED`/`ENABLE_WEB_SEARCH`
+   * env, config/types.ts) to disable per-deployment without a code change.
+   */
+  webSearchEnabled?: boolean;
+}
+
 export class ClaudeHaikuProvider implements LLMProvider {
   readonly name = "anthropic";
   readonly model: string;
   private readonly client: Anthropic;
+  private readonly webSearchEnabled: boolean;
 
-  constructor(apiKey: string, model: string) {
+  constructor(apiKey: string, model: string, options?: ClaudeHaikuProviderOptions) {
     this.client = new Anthropic({ apiKey });
     this.model = model;
+    this.webSearchEnabled = options?.webSearchEnabled ?? true;
   }
 
   async cheapGateCheck(input: CheapGateInput): Promise<CheapGateResult> {
@@ -110,6 +133,7 @@ export class ClaudeHaikuProvider implements LLMProvider {
   async generateResponse(request: LLMRequest): Promise<LLMResponse> {
     const transcriptText = formatTranscript(request.recentTranscript);
     const memoryText = formatMemory(request.memoryContext);
+    const guildJokesText = formatGuildJokes(request.guildRunningJokes);
 
     // Tone-variety mechanism (Merry) — named menu + "what you just did"
     // history, built fresh per request from `request.recentTones` (oldest
@@ -126,7 +150,10 @@ export class ClaudeHaikuProvider implements LLMProvider {
       `Your own recent lines appear in the transcript labeled "${request.persona.name}:". Do NOT repeat points`,
       "you already made or rephrase a reaction you already gave — if you've already addressed the current topic,",
       "either add a genuinely new angle or reply with empty text. Track where the conversation is RIGHT NOW and",
-      "respond to the latest thing being discussed, not something already handled a few lines ago.",
+      "respond to the latest thing being discussed, not something already handled a few lines ago. The same rule",
+      "applies to a bit that didn't land: if you asked a question or dropped a joke and the conversation has since",
+      "moved on without anyone picking it up, DROP it — don't repeat the question, don't re-explain the joke, don't",
+      "circle back to it later. Follow the conversation where it actually goes.",
       `Vary your delivery style turn to turn using this menu of named modes: ${RESPONSE_STYLE_MODES}.`,
       recentTonesLine,
       "Pick whichever mode genuinely fits what's happening right now — never force a roast or blunt line into a",
@@ -143,32 +170,67 @@ export class ClaudeHaikuProvider implements LLMProvider {
       "joined the voice channel, just left the voice channel, or that you just connected to the channel, that is a",
       "rare, deliberate moment meant for you to actually speak — always give a real, on-topic spoken line for those",
       "(even a brief one), never fall back to empty text for them.",
-    ].join(" ");
+      this.webSearchEnabled
+        ? "You have a web_search tool available. Use it ONLY when someone asks a real factual question you cannot" +
+          " confidently answer from your own knowledge or the transcript/memory context here — never use it" +
+          " reflexively on ordinary banter, and never narrate that you're searching; once you have an answer, just" +
+          " say it naturally, in your normal voice, in the reply JSON below."
+        : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
 
     const userContent = [
       `Recent voice chat transcript:\n${transcriptText.length > 0 ? transcriptText : "(no recent transcript)"}`,
       memoryText.length > 0 ? `\nWhat you remember about people here:\n${memoryText}` : "",
+      guildJokesText.length > 0 ? `\nRunning jokes/lore for this whole server (not tied to one person — use naturally as callbacks, don't force it):\n${guildJokesText}` : "",
+      request.liveContextOverride
+        ? `\nIMPORTANT LIVE CONTEXT (operator-set, temporary, takes priority over your own guess at what's going on right now): ${request.liveContextOverride}`
+        : "",
       `\nWhy you're responding now: ${request.triggerReason}`,
     ]
       .filter(Boolean)
       .join("\n");
 
     try {
-      const message = await this.client.messages.create({
-        model: this.model,
-        max_tokens: 300,
-        system,
-        messages: [{ role: "user", content: userContent }],
-      });
+      const message = await this.client.messages.create(
+        {
+          model: this.model,
+          max_tokens: 300,
+          system,
+          messages: [{ role: "user", content: userContent }],
+          ...(this.webSearchEnabled
+            ? { tools: [{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES_PER_TURN }] }
+            : {}),
+        },
+        // Explicit request timeout (config/constants.ts's doc comment on
+        // LLM_GENERATE_TIMEOUT_MS explains why this is one shared budget for
+        // both generation and any server-side web search, not two separate
+        // budgets) — on timeout, the catch below degrades to `{text: ""}`,
+        // same as any other generation failure.
+        { timeout: LLM_GENERATE_TIMEOUT_MS },
+      );
 
       const raw = extractText(message);
       const parsed = parseLLMReply(raw);
+      // Bug-fix round (task 1) — deterministic sanitizer applied to the
+      // FINAL text regardless of which parse path produced it (strict JSON,
+      // salvaged labeled-field fallback, or genuine plain prose), plus the
+      // banned-phrase backstop (task 2). Empty after sanitizing = nothing
+      // salvageable/safe, same contract as the pre-existing empty-response
+      // case (orchestrator.ts skips TTS/playback either way) — an untagged
+      // `tone` on an empty reply would just be a dangling label, so it's
+      // dropped too.
+      const sanitizedText = sanitizeSpokenText(parsed.text);
+      const webSearchCount = message.usage.server_tool_use?.web_search_requests;
+
       return {
-        text: parsed.text,
-        tone: parsed.tone,
+        text: sanitizedText,
+        tone: sanitizedText.length > 0 ? parsed.tone : undefined,
         usage: {
           inputTokens: message.usage.input_tokens ?? 0,
           outputTokens: message.usage.output_tokens ?? 0,
+          webSearchCount,
         },
       };
     } catch (err) {
@@ -178,6 +240,9 @@ export class ClaudeHaikuProvider implements LLMProvider {
       });
       // Empty text — orchestrator.ts skips TTS/playback for empty responses
       // rather than speaking a hardcoded fallback line into the channel.
+      // Covers both genuine API errors and a request-timeout abort (see the
+      // `timeout` option above) — both degrade the same way, never hang the
+      // pipeline.
       return { text: "", usage: { inputTokens: 0, outputTokens: 0 } };
     }
   }
@@ -224,6 +289,57 @@ export class ClaudeHaikuProvider implements LLMProvider {
         error: err instanceof Error ? err.message : String(err),
       });
       return { newFacts: [], usage: { inputTokens: 0, outputTokens: 0 } };
+    }
+  }
+
+  /**
+   * Guild-wide running jokes/lore periodic pass (task 4) — see
+   * `GuildJokeExtractionInputSchema`'s doc comment (llm/types.ts) for why
+   * this is a separate method from `extractMemoryFacts` rather than an
+   * extension of it, and `PipelineOrchestrator`'s joke-extraction counter
+   * for the calling cadence.
+   */
+  async extractGuildJokes(input: GuildJokeExtractionInput): Promise<GuildJokeExtractionResult> {
+    const transcriptText = formatTranscript(input.recentTranscript);
+    const system = [
+      "You review a stretch of live multi-speaker Discord voice-chat transcript and identify GROUP running jokes or",
+      "shared lore worth remembering long-term — bits, callbacks, or recurring references multiple people in the",
+      "conversation would recognize, NOT something tied to just one individual's personal facts (that's tracked",
+      "separately). Only extract something a reasonable listener would call an actual running joke/bit that already",
+      "landed and could plausibly be called back to later — not a single unrepeated one-off joke, not ordinary small",
+      "talk, and not anything already in the existing jokes list below.",
+      'Reply with ONLY compact JSON: {"jokes": ["short description of the joke/bit", ...]}.',
+      "Empty array is the right answer most of the time — most stretches of chat produce nothing new here.",
+    ].join(" ");
+
+    const userContent = [
+      `Existing guild running jokes/lore: ${input.existingJokes.length > 0 ? input.existingJokes.join("; ") : "(none yet)"}`,
+      `Recent transcript:\n${transcriptText}`,
+    ].join("\n");
+
+    try {
+      const message = await this.client.messages.create({
+        model: this.model,
+        max_tokens: 200,
+        system,
+        messages: [{ role: "user", content: userContent }],
+      });
+
+      const raw = extractText(message);
+      const parsed = parseGuildJokeExtractionReply(raw);
+      return {
+        newJokes: parsed.newJokes,
+        usage: {
+          inputTokens: message.usage.input_tokens ?? 0,
+          outputTokens: message.usage.output_tokens ?? 0,
+        },
+      };
+    } catch (err) {
+      log.error("extractGuildJokes call failed", {
+        guildId: input.guildId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return { newJokes: [], usage: { inputTokens: 0, outputTokens: 0 } };
     }
   }
 }
@@ -353,4 +469,9 @@ function formatMemory(
       return `${s.displayName} — ${parts.join(" | ")}`;
     })
     .join("\n");
+}
+
+/** Guild-wide running jokes/lore round (task 4) — flat list, no per-speaker attribution (that's the point, they're collective). */
+function formatGuildJokes(jokes: readonly string[]): string {
+  return jokes.join("\n");
 }

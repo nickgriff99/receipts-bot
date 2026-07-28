@@ -27,7 +27,9 @@ async function main(): Promise<void> {
   const config = loadConfig();
 
   const memory = new PostgresMemoryStore(config.storage.databaseUrl, config.defaults);
-  const llm = new ClaudeHaikuProvider(config.anthropic.apiKey, config.anthropic.model);
+  const llm = new ClaudeHaikuProvider(config.anthropic.apiKey, config.anthropic.model, {
+    webSearchEnabled: config.defaults.webSearchEnabled,
+  });
   const tts = new ElevenLabsTTSProvider(config.elevenlabs.apiKey);
   const playback = new DiscordPlaybackController();
   const rateLimiter = new InMemoryRateLimiter(async (guildId) => {

@@ -234,13 +234,25 @@ export class TurnTakingEngine {
 
     log.debug("cheap-gate result", { guildId: candidate.guildId, shouldRespond: gateResult.shouldRespond, reason: gateResult.reason });
 
-    await this.memory.logUsage({
-      guildId: candidate.guildId,
-      service: "llm",
-      unitType: "tokens",
-      units: gateResult.usage.inputTokens + gateResult.usage.outputTokens,
-      occurredAt: Date.now(),
-    });
+    // Fire-and-forget, logged on failure (merry, wiring pass) — a
+    // usage_log write is cost-audit only, must never abort turn-taking's
+    // shouldRespond decision. Same non-critical-persistence treatment as
+    // `orchestrator.ts`'s logUsage call sites and the `recordTurnOutcome`
+    // fire-and-forget precedent.
+    void this.memory
+      .logUsage({
+        guildId: candidate.guildId,
+        service: "llm",
+        unitType: "tokens",
+        units: gateResult.usage.inputTokens + gateResult.usage.outputTokens,
+        occurredAt: Date.now(),
+      })
+      .catch((err) => {
+        log.error("failed to log ambient cheap-gate usage", {
+          guildId: candidate.guildId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
 
     if (gateResult.shouldRespond) {
       return {
@@ -328,13 +340,20 @@ export class TurnTakingEngine {
 
     log.debug("interjection cheap-gate result", { guildId, shouldRespond: gateResult.shouldRespond, reason: gateResult.reason });
 
-    await this.memory.logUsage({
-      guildId,
-      service: "llm",
-      unitType: "tokens",
-      units: gateResult.usage.inputTokens + gateResult.usage.outputTokens,
-      occurredAt: now,
-    });
+    void this.memory
+      .logUsage({
+        guildId,
+        service: "llm",
+        unitType: "tokens",
+        units: gateResult.usage.inputTokens + gateResult.usage.outputTokens,
+        occurredAt: now,
+      })
+      .catch((err) => {
+        log.error("failed to log interjection cheap-gate usage", {
+          guildId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
 
     return {
       candidate,
@@ -441,13 +460,20 @@ export class TurnTakingEngine {
       reason: gateResult.reason,
     });
 
-    await this.memory.logUsage({
-      guildId: candidate.guildId,
-      service: "llm",
-      unitType: "tokens",
-      units: gateResult.usage.inputTokens + gateResult.usage.outputTokens,
-      occurredAt: Date.now(),
-    });
+    void this.memory
+      .logUsage({
+        guildId: candidate.guildId,
+        service: "llm",
+        unitType: "tokens",
+        units: gateResult.usage.inputTokens + gateResult.usage.outputTokens,
+        occurredAt: Date.now(),
+      })
+      .catch((err) => {
+        log.error("failed to log proactive cheap-gate usage", {
+          guildId: candidate.guildId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
 
     return {
       candidate,

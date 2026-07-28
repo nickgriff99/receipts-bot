@@ -12,6 +12,8 @@ import {
   ACTIVE_THREAD_TTL_MS,
   BOT_SPEAKER_ID,
   CONTEXT_WINDOW_UTTERANCES,
+  GUILD_JOKE_EXTRACTION_HISTORY_WINDOW,
+  GUILD_JOKE_EXTRACTION_INTERVAL_SEGMENTS,
   LATENCY_WARN_THRESHOLD_MS,
   MAX_RECENT_TONES_PER_GUILD,
   PLAYBACK_AWAIT_TIMEOUT_MS,
@@ -228,6 +230,15 @@ export class PipelineOrchestrator {
    * operational definition. Keyed guildId -> userId -> state.
    */
   private readonly activeThreadByGuild = new Map<string, Map<string, ActiveThreadState>>();
+  /**
+   * Guild-wide running jokes/lore round (task 4) — counts final human
+   * transcript segments per guild since the last periodic joke-extraction
+   * pass fired; reset to 0 (not just decremented) each time
+   * `GUILD_JOKE_EXTRACTION_INTERVAL_SEGMENTS` is reached. See
+   * `maybeExtractGuildJokes`'s doc comment for why this is a segment-count
+   * cadence rather than a wall-clock timer.
+   */
+  private readonly guildJokeSegmentCounterByGuild = new Map<string, number>();
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.turnTaking = new TurnTakingEngine(deps.llm, deps.rateLimiter, deps.memory, deps.proactive?.intervalSeconds);
@@ -276,13 +287,44 @@ export class PipelineOrchestrator {
     // actually exposes per segment), not a literal dollar-cost mirror.
     // Flagged here rather than silently presented as exact.
     if (segment.isFinal && segment.text.length > 0) {
-      await this.deps.memory.logUsage({
-        guildId: segment.guildId,
-        service: "stt",
-        unitType: "characters",
-        units: segment.text.length,
-        occurredAt: Date.now(),
-      });
+      // Fire-and-forget, logged on failure (merry, wiring pass) — a
+      // usage_log write is a cost-audit side effect, not something the
+      // segment-handling path should ever block on or abort for. Matches
+      // the `recordTurnOutcome` fire-and-forget precedent below
+      // (`resolveEngagementOnHumanSegment`/`expireStaleEngagementIfNeeded`)
+      // — this project treats usage/engagement logging as non-critical
+      // persistence uniformly, not just for the newest (`web_search`) row.
+      void this.deps.memory
+        .logUsage({
+          guildId: segment.guildId,
+          service: "stt",
+          unitType: "characters",
+          units: segment.text.length,
+          occurredAt: Date.now(),
+        })
+        .catch((err) => {
+          log.error("failed to log stt usage", {
+            guildId: segment.guildId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+
+      // Guild-wide running jokes/lore round (task 4) — cadence-count real
+      // human speech, not calendar time, so the pass only fires when there's
+      // actually been enough fresh conversation to reflect on (mirrors
+      // Neuro's `modules/memory.py` reflect-every-~20-messages precedent —
+      // see GUILD_JOKE_EXTRACTION_INTERVAL_SEGMENTS's doc comment for the
+      // full reasoning vs. a per-exchange approach). Fire-and-forget: this
+      // must never block the turn-taking tail below.
+      const count = (this.guildJokeSegmentCounterByGuild.get(segment.guildId) ?? 0) + 1;
+      if (count >= GUILD_JOKE_EXTRACTION_INTERVAL_SEGMENTS) {
+        this.guildJokeSegmentCounterByGuild.set(segment.guildId, 0);
+        void this.maybeExtractGuildJokes(segment.guildId).catch((err) => {
+          log.error("guild-joke extraction pass failed", { guildId: segment.guildId, error: err instanceof Error ? err.message : String(err) });
+        });
+      } else {
+        this.guildJokeSegmentCounterByGuild.set(segment.guildId, count);
+      }
     }
 
     // Expensive tail (turn-taking decision -> Claude -> TTS -> playback ->
@@ -597,13 +639,55 @@ export class PipelineOrchestrator {
       this.recentTonesFor(item.guildId),
     );
     const response = await this.deps.llm.generateResponse(request);
-    await this.deps.memory.logUsage({
-      guildId: item.guildId,
-      service: "llm",
-      unitType: "tokens",
-      units: response.usage.inputTokens + response.usage.outputTokens,
-      occurredAt: Date.now(),
-    });
+    // Fire-and-forget usage logging (merry, wiring pass) — see the STT
+    // usage-log comment in `handleSegment` above for why: a failed
+    // usage_log write must never abort a turn, especially not HERE, after
+    // an already-paid-for LLM generation has succeeded and a spoken reply
+    // is waiting to go out. Applies uniformly to every logUsage call in
+    // this method (llm/web_search/tts below), not just the newest one.
+    void this.deps.memory
+      .logUsage({
+        guildId: item.guildId,
+        service: "llm",
+        unitType: "tokens",
+        units: response.usage.inputTokens + response.usage.outputTokens,
+        occurredAt: Date.now(),
+      })
+      .catch((err) => {
+        log.error("failed to log llm usage", {
+          guildId: item.guildId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+
+    // Web-lookup round (frodo, task 3) — persisted as its own `usage_log`
+    // service+unit (Sam's contract lock: `UsageServiceSchema`'s
+    // `"web_search"` / `UsageUnitTypeSchema`'s `"searches"`, see
+    // `UsageSchema.webSearchCount`'s doc comment in llm/types.ts) since web
+    // search is billed per-search, a genuinely different unit than the
+    // token-count row just logged above. Only writes when truthy — 0/
+    // undefined both mean "no search happened this call", not a real
+    // zero-unit event worth a row.
+    if (response.usage.webSearchCount) {
+      log.info("web search used during response generation", {
+        guildId: item.guildId,
+        webSearchCount: response.usage.webSearchCount,
+      });
+      void this.deps.memory
+        .logUsage({
+          guildId: item.guildId,
+          service: "web_search",
+          unitType: "searches",
+          units: response.usage.webSearchCount,
+          occurredAt: Date.now(),
+        })
+        .catch((err) => {
+          log.error("failed to log web_search usage", {
+            guildId: item.guildId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+    }
 
     // Empty text is a genuine "nothing to say" outcome (persona/parseLLMReply
     // fallback both allow it deliberately, see llm/types.ts) — skip TTS/
@@ -647,13 +731,20 @@ export class PipelineOrchestrator {
 
     const priority: PlaybackPriority = isExplicitTrigger(item.triggerType) ? "explicit" : "ambient";
 
-    await this.deps.memory.logUsage({
-      guildId: item.guildId,
-      service: "tts",
-      unitType: "characters",
-      units: response.text.length,
-      occurredAt: Date.now(),
-    });
+    void this.deps.memory
+      .logUsage({
+        guildId: item.guildId,
+        service: "tts",
+        unitType: "characters",
+        units: response.text.length,
+        occurredAt: Date.now(),
+      })
+      .catch((err) => {
+        log.error("failed to log tts usage", {
+          guildId: item.guildId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
 
     // Speech-end -> bot-starts-speaking latency is only meaningful when a
     // real utterance triggered this turn — a proactive turn has no
@@ -730,13 +821,20 @@ export class PipelineOrchestrator {
       botReplyText,
       existingFacts: existingProfile?.facts ?? [],
     });
-    await this.deps.memory.logUsage({
-      guildId: segment.guildId,
-      service: "llm",
-      unitType: "tokens",
-      units: extraction.usage.inputTokens + extraction.usage.outputTokens,
-      occurredAt: Date.now(),
-    });
+    void this.deps.memory
+      .logUsage({
+        guildId: segment.guildId,
+        service: "llm",
+        unitType: "tokens",
+        units: extraction.usage.inputTokens + extraction.usage.outputTokens,
+        occurredAt: Date.now(),
+      })
+      .catch((err) => {
+        log.error("failed to log memory-extraction llm usage", {
+          guildId: segment.guildId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
 
     if (extraction.newFacts.length === 0 && !extraction.sentimentNotes) return;
 
@@ -748,6 +846,45 @@ export class PipelineOrchestrator {
       if (profile) {
         await this.deps.memory.upsertProfile({ ...profile, sentimentNotes: extraction.sentimentNotes, updatedAt: Date.now() });
       }
+    }
+  }
+
+  /**
+   * Guild-wide running jokes/lore periodic pass (task 4). Reads a wider
+   * recent-history window than a normal turn (`GUILD_JOKE_EXTRACTION_HISTORY_WINDOW`
+   * vs. `CONTEXT_WINDOW_UTTERANCES`) since it's summarizing a whole recent
+   * stretch of multi-speaker conversation, not just the current exchange —
+   * called from `handleSegment`'s cadence counter, not the turn queue (this
+   * is a background reflection pass, not a "should I speak" decision, so it
+   * doesn't need the serialization `GuildTurnQueue` exists for).
+   */
+  private async maybeExtractGuildJokes(guildId: string): Promise<void> {
+    const recentTranscript = this.historyFor(guildId).slice(-GUILD_JOKE_EXTRACTION_HISTORY_WINDOW);
+    if (recentTranscript.length === 0) return;
+
+    const existing = await this.deps.memory.getGuildMemory(guildId);
+    const extraction = await this.deps.llm.extractGuildJokes({
+      guildId,
+      recentTranscript,
+      existingJokes: existing.runningJokes,
+    });
+    void this.deps.memory
+      .logUsage({
+        guildId,
+        service: "llm",
+        unitType: "tokens",
+        units: extraction.usage.inputTokens + extraction.usage.outputTokens,
+        occurredAt: Date.now(),
+      })
+      .catch((err) => {
+        log.error("failed to log guild-joke-extraction llm usage", {
+          guildId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+
+    if (extraction.newJokes.length > 0) {
+      await this.deps.memory.appendGuildRunningJokes(guildId, extraction.newJokes);
     }
   }
 

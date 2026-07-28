@@ -7,6 +7,7 @@ import {
   FALLBACK_AUTO_JOIN_ON_USER_ENTRY,
   FALLBACK_PROACTIVE_CHIME_INTERVAL_SECONDS,
   FALLBACK_PROACTIVE_CHIME_ENABLED,
+  FALLBACK_WEB_SEARCH_ENABLED,
 } from "./constants";
 
 /**
@@ -113,6 +114,15 @@ export const AppConfigSchema = z
     DEFAULT_PROACTIVE_CHIME_INTERVAL_SECONDS: z.coerce.number().int().positive().default(FALLBACK_PROACTIVE_CHIME_INTERVAL_SECONDS),
     DEFAULT_PROACTIVE_CHIME_ENABLED: boolEnvFlag(FALLBACK_PROACTIVE_CHIME_ENABLED),
 
+    /**
+     * Web-lookup round (frodo, task 3) — master on/off switch for Claude's
+     * native `web_search` server tool in `generateResponse`, same
+     * "independent kill switch, redeployable without a code change"
+     * precedent as `DEFAULT_PROACTIVE_CHIME_ENABLED` above. Owner confirmed
+     * adding real web lookup this round, so this defaults to `true`.
+     */
+    DEFAULT_WEB_SEARCH_ENABLED: boolEnvFlag(FALLBACK_WEB_SEARCH_ENABLED),
+
     LOG_LEVEL: LogLevelSchema.default("info"),
   })
   .transform((env) => ({
@@ -150,6 +160,7 @@ export const AppConfigSchema = z
       autoJoinOnUserEntry: env.DEFAULT_AUTO_JOIN_ON_USER_ENTRY,
       proactiveChimeIntervalSeconds: env.DEFAULT_PROACTIVE_CHIME_INTERVAL_SECONDS,
       proactiveChimeEnabled: env.DEFAULT_PROACTIVE_CHIME_ENABLED,
+      webSearchEnabled: env.DEFAULT_WEB_SEARCH_ENABLED,
     },
     logLevel: env.LOG_LEVEL,
   }));

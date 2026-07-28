@@ -61,12 +61,49 @@ export const LLMRequestSchema = z.object({
    * normal state for a guild's first few turns.
    */
   recentTones: z.array(z.string()),
+  /**
+   * Guild-wide running jokes/lore round (frodo, task 4) — collective jokes
+   * NOT tied to one person, distinct from `MemoryContextSlice.runningJokes`
+   * (per-user). Always supplied (empty array is the normal early-guild
+   * state), same "required field, ContextAssembler is the sole builder"
+   * convention as `recentTones` — see that field's doc comment for why this
+   * schema isn't used with `.default()` here.
+   */
+  guildRunningJokes: z.array(z.string()),
+  /**
+   * Live-steering admin injection round (frodo, task 5) — operator-set
+   * temporary context (`GuildSettings.liveContextOverride`), already
+   * TTL-filtered by `ContextAssembler` (undefined here means either nothing
+   * is set, or it expired — callers never need to re-check the expiry
+   * themselves). `undefined` in the overwhelming common case (no active
+   * override).
+   */
+  liveContextOverride: z.string().optional(),
 });
 export type LLMRequest = z.infer<typeof LLMRequestSchema>;
 
 const UsageSchema = z.object({
   inputTokens: z.number().int().nonnegative(),
   outputTokens: z.number().int().nonnegative(),
+  /**
+   * Web-lookup round (frodo, task 3) — how many times Claude's native
+   * `web_search` server tool actually fired during this call (from
+   * `Message.usage.server_tool_use.web_search_requests`), `undefined` when
+   * the web_search tool wasn't enabled/offered for this call at all (not the
+   * same as "enabled but unused", which is `0`).
+   *
+   * Sam's contract-lock decision: persisted to `usage_log` as its own
+   * service (`UsageServiceSchema`'s `"web_search"` member, unit
+   * `"searches"`) rather than folded into the `'llm'`/`'tokens'` row (would
+   * misrepresent cost) — a genuinely different billing unit gets a
+   * genuinely different row, same reasoning `'stt'`/`'tts'` already use for
+   * their own character-count rows. `pipeline/orchestrator.ts#runTurn`
+   * writes this row only when `webSearchCount` is truthy (0/undefined both
+   * skip the write — no zero-unit rows), and also still logs it to the
+   * structured logger for real-time observability alongside the persisted
+   * audit row.
+   */
+  webSearchCount: z.number().int().nonnegative().optional(),
 });
 
 /** Internal, validated response shape — what `LLMProvider.generateResponse` returns after lenient-parsing the raw model reply. */
@@ -91,14 +128,42 @@ export type LLMRawReply = z.infer<typeof LLMRawReplySchema>;
  * Order of attempts:
  *  1. Strict JSON.parse + `LLMRawReplySchema` — the persona is asked for
  *     `{"text": ..., "tone": ...}` and usually complies.
- *  2. Plain-text fallback — treat the whole trimmed completion as `text`
- *     with no `tone`. This is deliberate: persona prompt allows plain text
- *     too (brief section 4), so a non-JSON reply is not an error case.
- *  3. Empty-string guard — if even the trimmed fallback is empty, this is
+ *  2. Salvage pass (bug-fix round, task 1) — if the reply isn't valid JSON
+ *     but LOOKS like a failed structured attempt (`looksLikeFailedStructuredReply`:
+ *     starts with `{`, or carries a `text:`/`tone:`-style label), it is a
+ *     different case than genuine plain prose and must not be trusted
+ *     verbatim — this is the exact shape of the owner's reported bug
+ *     ("text... tone... observation" spoken aloud). Try to salvage just the
+ *     `text` (and `tone`) field VALUES out of it (`extractLabeledField`)
+ *     instead of speaking the labels too. If a text value can be salvaged,
+ *     return it (still passed through `llm/sanitize.ts#sanitizeSpokenText`
+ *     by the caller, same as every other path — this function only owns
+ *     parse-fidelity, not TTS-speakability). If nothing salvageable is
+ *     found, this is treated as a genuine failure (empty text, same
+ *     contract as case 4 below) rather than falling through to case 3 and
+ *     speaking the raw broken completion.
+ *  3. Plain-text fallback — ONLY reached when the reply doesn't look like a
+ *     failed structured attempt at all: treat the whole trimmed completion
+ *     as `text` with no `tone`. This is deliberate: persona prompt allows
+ *     plain text too (brief section 4), so a genuine non-JSON reply is not
+ *     an error case.
+ *  4. Empty-string guard — if even the trimmed fallback is empty, this is
  *     a genuine failure (e.g. the model returned only whitespace); caller
  *     should treat that as "nothing to say" rather than play a blank/silent
- *     TTS clip. Merry: `generateResponse` should skip playback in that case,
- *     not synthesize an empty utterance.
+ *     TTS clip. `generateResponse`/`orchestrator.ts` skip playback in that
+ *     case, not synthesize an empty utterance.
+ *
+ * One-shot retry-with-stricter-instruction was considered instead of/in
+ * addition to this salvage-and-sanitize approach and deliberately NOT
+ * implemented this round: a retry adds a full extra API round-trip (real
+ * latency in a live voice pipeline, real added cost) and is not actually
+ * guaranteed to fix anything — the model could fail the same way twice.
+ * Salvage-and-sanitize is strictly cheaper (zero added latency/cost) and
+ * deterministic (string parsing, not dependent on the model behaving
+ * better on a second attempt). Revisit if live-listening logs show the
+ * salvage path failing open too often (i.e. genuinely losing good replies,
+ * not just broken ones) — that would be the actual signal a retry is worth
+ * the cost, not a guess made up front.
  */
 export function parseLLMReply(raw: string): { text: string; tone?: string } {
   const jsonCandidate = extractJsonObject(raw);
@@ -111,8 +176,75 @@ export function parseLLMReply(raw: string): { text: string; tone?: string } {
       issues: parsed.error.issues.map((i) => i.message),
     });
   }
+
+  if (looksLikeFailedStructuredReply(raw)) {
+    const salvagedText = extractLabeledField(raw, "text");
+    if (salvagedText) {
+      const salvagedTone = extractLabeledField(raw, "tone");
+      log.warn("LLM reply looked like a failed JSON/labeled-field attempt — salvaged the text field instead of speaking labels verbatim", {
+        raw: raw.slice(0, 200),
+      });
+      return { text: salvagedText, tone: salvagedTone };
+    }
+    log.warn("LLM reply looked like a failed structured attempt with no salvageable text field — treating as nothing to say", {
+      raw: raw.slice(0, 200),
+    });
+    return { text: "" };
+  }
+
   const text = raw.trim();
   return { text };
+}
+
+/**
+ * True if `raw` looks like a failed attempt at the requested
+ * `{"text": ..., "tone": ...}` shape rather than genuine plain spoken
+ * prose — a real spoken line essentially never starts with a literal `{` or
+ * the word `text` followed by a colon, or carries a `tone: <mode-name>`
+ * fragment. Deliberately conservative (checks for the SPECIFIC shapes this
+ * prompt asks for, not a generic "contains a colon" heuristic) so it doesn't
+ * misfire on ordinary prose that happens to contain a colon (e.g. "Fine,
+ * three options: pizza, tacos, or regret").
+ */
+function looksLikeFailedStructuredReply(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return false;
+  if (trimmed.startsWith("{")) return true; // truncated/malformed JSON — already failed extractJsonObject above
+  if (/^["']?\btext\b["']?\s*:/i.test(trimmed)) return true;
+  if (/["']?\btone\b["']?\s*:\s*["']?[a-z_]+["']?/i.test(trimmed)) return true;
+  return false;
+}
+
+const KNOWN_RAW_REPLY_LABELS = ["text", "tone", "reason", "respond"];
+
+/**
+ * Best-effort extraction of one labeled field's VALUE from a raw completion
+ * that looks like a failed structured attempt (see
+ * `looksLikeFailedStructuredReply`) — handles both a `key: value` plain
+ * labeled format and a truncated/malformed `"key": "value"` JSON fragment.
+ * Returns `undefined` (never throws) if the label isn't present or its
+ * value is empty after cleanup.
+ */
+function extractLabeledField(raw: string, field: string): string | undefined {
+  const labelRe = new RegExp(`["']?\\b${field}\\b["']?\\s*:\\s*`, "i");
+  const match = labelRe.exec(raw);
+  if (!match) return undefined;
+
+  let rest = raw.slice(match.index + match[0].length);
+
+  const quoted = /^["']([\s\S]*?)["']\s*(?:[,}]|$)/.exec(rest);
+  if (quoted) {
+    const value = quoted[1].trim();
+    return value.length > 0 ? value : undefined;
+  }
+
+  const otherLabels = KNOWN_RAW_REPLY_LABELS.filter((label) => label !== field);
+  const nextLabelRe = new RegExp(`["']?\\b(?:${otherLabels.join("|")})\\b["']?\\s*:`, "i");
+  const nextMatch = nextLabelRe.exec(rest);
+  if (nextMatch) rest = rest.slice(0, nextMatch.index);
+
+  const value = rest.replace(/[{}"']/g, "").trim();
+  return value.length > 0 ? value : undefined;
 }
 
 /** The JSON shape we prompt Claude to reply with for the ambient cheap-gate check. */
@@ -249,6 +381,63 @@ export const MemoryExtractionResultSchema = z.object({
 export type MemoryExtractionResult = z.infer<typeof MemoryExtractionResultSchema>;
 
 /**
+ * Guild-wide running jokes/lore round (frodo, task 4) — a SEPARATE periodic
+ * pass, not a per-exchange one like `extractMemoryFacts` above. Decision,
+ * documented here rather than left implicit: guild-wide jokes are
+ * collective (often nobody's individual exchange with the bot — they emerge
+ * from humans talking among themselves), so tying extraction to "the
+ * exchange that just finished between the bot and one person"
+ * (`extractMemoryFacts`'s trigger) would structurally miss most of them, and
+ * would also mean paying the extra prompt-context cost of the existing
+ * guild-jokes list on every single bot turn regardless of whether anything
+ * guild-worthy happened. Instead, `PipelineOrchestrator` counts final human
+ * transcript segments per guild and fires this over a wider recent-history
+ * window every `GUILD_JOKE_EXTRACTION_INTERVAL_SEGMENTS` segments
+ * (config/constants.ts) — mirrors Neuro's `modules/memory.py` reflect-every-
+ * ~20-messages cadence, which is a better fit for "collective, emerges over
+ * many exchanges" than a per-turn check.
+ */
+export const GuildJokeExtractionInputSchema = z.object({
+  guildId: z.string().min(1),
+  /** Recent multi-speaker window, oldest first — wider than a single exchange (see GUILD_JOKE_EXTRACTION_HISTORY_WINDOW). */
+  recentTranscript: z.array(TranscriptSegmentSchema),
+  existingJokes: z.array(z.string()),
+});
+export type GuildJokeExtractionInput = z.infer<typeof GuildJokeExtractionInputSchema>;
+
+export const GuildJokeExtractionResultSchema = z.object({
+  /** New guild-wide running jokes worth persisting. Empty array = nothing new this pass — the common case. */
+  newJokes: z.array(z.string()),
+  usage: UsageSchema,
+});
+export type GuildJokeExtractionResult = z.infer<typeof GuildJokeExtractionResultSchema>;
+
+/** The JSON shape we prompt Claude to reply with for guild-joke extraction. */
+export const GuildJokeExtractionRawReplySchema = z.object({
+  jokes: z.array(z.string().min(1)).default([]),
+});
+export type GuildJokeExtractionRawReply = z.infer<typeof GuildJokeExtractionRawReplySchema>;
+
+/**
+ * Lenient-parse a raw Claude completion for `extractGuildJokes` — same
+ * fail-safe-to-nothing-new contract as `parseMemoryExtractionReply` (losing
+ * a joke occasionally is fine; inventing one is not).
+ */
+export function parseGuildJokeExtractionReply(raw: string): { newJokes: string[] } {
+  const jsonCandidate = extractJsonObject(raw);
+  if (jsonCandidate) {
+    const parsed = GuildJokeExtractionRawReplySchema.safeParse(jsonCandidate);
+    if (parsed.success) {
+      return { newJokes: parsed.data.jokes };
+    }
+    log.warn("guild-joke-extraction reply failed schema validation, defaulting to no new jokes", {
+      issues: parsed.error.issues.map((i) => i.message),
+    });
+  }
+  return { newJokes: [] };
+}
+
+/**
  * Every LLM backend implements this. v1 only ships `ClaudeHaikuProvider`
  * (both the cheap gate and full generation use the same haiku model per
  * locked stakeholder decision — no dual-model split), but keeping the
@@ -260,4 +449,6 @@ export interface LLMProvider {
   cheapGateCheck(input: CheapGateInput): Promise<CheapGateResult>;
   generateResponse(request: LLMRequest): Promise<LLMResponse>;
   extractMemoryFacts(input: MemoryExtractionInput): Promise<MemoryExtractionResult>;
+  /** Guild-wide running-jokes/lore periodic pass (task 4) — see `GuildJokeExtractionInputSchema`'s doc comment for why this is separate from `extractMemoryFacts`. */
+  extractGuildJokes(input: GuildJokeExtractionInput): Promise<GuildJokeExtractionResult>;
 }

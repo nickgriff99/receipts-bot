@@ -122,3 +122,72 @@ export const INTERJECTION_MIN_INTERVAL_SECONDS = 30;
  */
 export const PROACTIVE_JITTER_MIN_MULTIPLIER = 0.75;
 export const PROACTIVE_JITTER_MAX_MULTIPLIER = 1.5;
+
+/**
+ * Persona/web-search round (frodo, task 3): master on/off switch fallback
+ * for Claude's native `web_search` server tool in `generateResponse` — same
+ * "independent kill switch, redeployable without a code change" precedent as
+ * `FALLBACK_PROACTIVE_CHIME_ENABLED`. Owner confirmed adding real web lookup
+ * this round; this flag exists so a deployment can turn it off (e.g.
+ * unexpected cost spike mid-incident) without touching code.
+ */
+export const FALLBACK_WEB_SEARCH_ENABLED = true;
+
+/**
+ * Ceiling on how many times Claude's web_search tool may actually fire
+ * WITHIN a single `generateResponse` call (Anthropic's `max_uses` tool
+ * param). One is enough for "answer the factual question that was just
+ * asked" — the brief's ask is a quick factual lookup mid-conversation, not
+ * open-ended multi-step research, and every extra allowed use is both
+ * latency and cost this is a live voice pipeline can't spend generously.
+ */
+export const WEB_SEARCH_MAX_USES_PER_TURN = 1;
+
+/**
+ * Explicit request timeout (ms) for `generateResponse`'s `messages.create`
+ * call — previously uncapped (relied on the SDK's own default). Needed now
+ * because enabling the web_search tool means a single call can include a
+ * server-side search round-trip before Claude finishes composing its answer;
+ * Anthropic's web_search tool executes INSIDE the same request, so there is
+ * no way to give "search" and "generation" separate budgets — only one
+ * timeout for the whole call. Applied unconditionally (not just when the
+ * tool is enabled) since an uncapped LLM call blocking a guild's serialized
+ * turn queue (`PipelineOrchestrator.drainTurnQueue`) was always a latent
+ * risk, not just a web-search-specific one. On timeout, the existing
+ * try/catch in `generateResponse` already degrades to `{text: ""}` (no new
+ * failure path needed) — orchestrator.ts already skips TTS/playback for
+ * empty text, so a slow search never hangs the voice pipeline, it just
+ * results in the bot silently not answering that turn.
+ */
+export const LLM_GENERATE_TIMEOUT_MS = 15_000;
+
+/**
+ * Guild-wide running jokes/lore round (frodo, task 4): how many final human
+ * transcript segments accumulate per guild (`PipelineOrchestrator`) before a
+ * periodic guild-level joke-extraction pass fires. Deliberately NOT
+ * per-exchange like `extractMemoryFacts` (see `MemoryStore.appendGuildRunningJokes`'s
+ * doc comment / the round handoff for the full reasoning) — mirrors Neuro's
+ * `modules/memory.py` reflect-every-~20-messages cadence, which fits
+ * "collective, emerges-over-many-exchanges" jokes better than a per-turn
+ * check tied to one person's exchange with the bot.
+ */
+export const GUILD_JOKE_EXTRACTION_INTERVAL_SEGMENTS = 20;
+
+/** How many recent transcript segments the periodic guild-joke extraction pass reads over — wider than CONTEXT_WINDOW_UTTERANCES since it's summarizing a whole recent stretch, not just the current exchange. */
+export const GUILD_JOKE_EXTRACTION_HISTORY_WINDOW = 40;
+
+/** Cap on guild-wide running jokes, mirroring `MAX_RUNNING_JOKES_PER_PROFILE`'s per-user cap/reasoning (schema-lock: short list, always read/written whole, enforced at both the Zod boundary and the store's dedupe-append truncation). */
+export const MAX_GUILD_RUNNING_JOKES = 20;
+
+/**
+ * Live-steering admin injection round (frodo, task 5): default and max
+ * time-to-live for `GuildSettings.liveContextOverride`. Neuro's
+ * `modules/customPrompt.py` precedent this is modeled on is clearable by the
+ * operator, but nothing stops an operator from forgetting to clear it —
+ * `MemoryStore.setLiveContextOverride` computes `expiresAt` server-side as
+ * `min(requested ttl, MAX)`, so a forgotten override always self-expires
+ * (lazily, on next read — see `ContextAssembler`) rather than silently
+ * steering every future conversation forever.
+ */
+export const LIVE_CONTEXT_OVERRIDE_DEFAULT_TTL_MS = 2 * 60 * 60 * 1000; // 2h
+export const LIVE_CONTEXT_OVERRIDE_MAX_TTL_MS = 12 * 60 * 60 * 1000; // 12h safety cap

@@ -115,6 +115,9 @@ still come from `.env` via `env_file`.
 | `/quiet` / `/active` | Same as `/mode`, one-word aliases (both call the same underlying setting). |
 | `/optout` | Exclude yourself from transcription/memory in this server. |
 | `/optin` | Reverse `/optout`. |
+| `/setconsentchannel channel:<#channel>` | Pin the consent notice to a specific text channel. |
+| `/setcontext text:<...> duration:<optional, e.g. 30m\|2h>` | Temporarily steer the bot's tone/context (e.g. "we're watching a movie"). Defaults to 2h, capped at 12h. |
+| `/clearcontext` | Clear an active `/setcontext` override early. |
 
 All settings/opt-out writes go through `MemoryStore.setGuildSettings` /
 `MemoryStore.setOptOut` — never raw SQL from a command handler.

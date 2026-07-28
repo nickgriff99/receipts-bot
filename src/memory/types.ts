@@ -6,6 +6,7 @@ import {
   MAX_RUNNING_JOKES_PER_PROFILE,
   MAX_FACT_LENGTH,
   MAX_SENTIMENT_NOTES_LENGTH,
+  MAX_GUILD_RUNNING_JOKES,
 } from "../config/constants";
 
 /**
@@ -95,9 +96,60 @@ export const GuildSettingsSchema = z.object({
    * actually shows a need, not defaulted on process-wide.
    */
   maxExplicitResponsesPerMinute: z.number().int().positive().optional(),
+  /**
+   * Live-steering admin injection round (frodo, task 5) — operator-set
+   * temporary context (Neuro's `modules/customPrompt.py` precedent, e.g.
+   * "we're watching a movie right now"), read by `ContextAssembler` and fed
+   * into `generateResponse`'s prompt. `undefined` (the default, every guild
+   * until an operator sets one) means "no override active".
+   *
+   * READ-ONLY via the generic `setGuildSettings` patch path deliberately —
+   * see `MemoryStore.setLiveContextOverride`/`clearLiveContextOverride`'s
+   * doc comments for why the WRITE side is two dedicated methods instead of
+   * routing through the same generic patch every other optional override
+   * (`voiceId`/`consentChannelId`) uses. `PostgresMemoryStore#setGuildSettings`
+   * ignores these two fields even if a caller passes them in `patch` — the
+   * HTTP admin route (`http/routes/admin.ts`) also excludes them from its
+   * Zod patch schema, so there is no path that can set an override without
+   * going through the TTL-capping logic.
+   */
+  liveContextOverride: z.string().min(1).optional(),
+  /** Epoch ms this override stops being surfaced into the prompt — always present when `liveContextOverride` is, always absent otherwise (enforced below). Lazily filtered by `ContextAssembler` on read, not swept/cleared server-side — see `LIVE_CONTEXT_OVERRIDE_MAX_TTL_MS`'s doc comment. */
+  liveContextOverrideExpiresAt: z.number().int().nonnegative().optional(),
   updatedAt: z.number().int().nonnegative(),
 });
 export type GuildSettings = z.infer<typeof GuildSettingsSchema>;
+/**
+ * `liveContextOverride`/`liveContextOverrideExpiresAt` are deliberately NOT
+ * enforced as a paired invariant at the Zod level (no `.refine()` on
+ * `GuildSettingsSchema` itself) — `.refine()` returns a `ZodEffects`-style
+ * wrapper that loses the plain-object methods (`.omit()`/`.partial()`)
+ * `http/routes/admin.ts#GuildSettingsPatchSchema` already relies on. The
+ * pairing invariant is instead enforced procedurally, the only place it can
+ * actually be violated: `MemoryStore.setLiveContextOverride`/
+ * `clearLiveContextOverride` are the sole write path for these two fields
+ * (see their doc comments), and both always set/clear the pair together.
+ */
+
+/**
+ * Guild-wide running jokes/lore round (frodo, task 4) — one row per guild,
+ * separate table from `guild_settings` deliberately (not another JSON
+ * column bolted onto that table): `guild_settings` is documented
+ * (config/types.ts) as "the per-guild, DB-backed, ADMIN-MUTABLE config" —
+ * jokes here are bot-LEARNED collective memory, a different concern even
+ * though the storage shape (short JSON array, always read/written whole) is
+ * the same pattern as `user_profiles.running_jokes_json` and follows the
+ * same schema-lock reasoning (see that field's doc comment above): short
+ * list, no per-item query/filter requirement in v1, capped at
+ * `MAX_GUILD_RUNNING_JOKES` both here and in
+ * `postgresStore.ts#dedupeAppend`.
+ */
+export const GuildMemorySchema = z.object({
+  guildId: z.string().min(1),
+  runningJokes: z.array(FactStringSchema).max(MAX_GUILD_RUNNING_JOKES),
+  updatedAt: z.number().int().nonnegative(),
+});
+export type GuildMemory = z.infer<typeof GuildMemorySchema>;
 
 /**
  * Adaptive-cadence learning signal (social-presence round, frodo — brief
@@ -163,10 +215,20 @@ export const EngagementBucketSchema = z.object({
 });
 export type EngagementBucket = z.infer<typeof EngagementBucketSchema>;
 
-export const UsageServiceSchema = z.enum(["stt", "llm", "tts"]);
+/**
+ * `"web_search"` added by Sam (contract-lock round) — Claude's native
+ * `web_search` server tool (frodo, web-lookup round, task 3) is billed
+ * PER-SEARCH, a genuinely different unit than the `'llm'`/`'tokens'` row
+ * already logged for the same `generateResponse` call, so it gets its own
+ * service instead of folding the count into that row (which would
+ * misrepresent cost). See `UsageUnitTypeSchema`'s `"searches"` member and
+ * `pipeline/orchestrator.ts`'s `runTurn` for the persisted write.
+ */
+export const UsageServiceSchema = z.enum(["stt", "llm", "tts", "web_search"]);
 export type UsageService = z.infer<typeof UsageServiceSchema>;
 
-export const UsageUnitTypeSchema = z.enum(["characters", "tokens"]);
+/** `"searches"` (Sam, contract-lock round) — unit for `UsageServiceSchema`'s `"web_search"` member, one unit per actual `web_search` tool invocation. */
+export const UsageUnitTypeSchema = z.enum(["characters", "tokens", "searches"]);
 export type UsageUnitType = z.infer<typeof UsageUnitTypeSchema>;
 
 export const UsageLogEntrySchema = z.object({
@@ -204,6 +266,40 @@ export interface MemoryStore {
 
   getGuildSettings(guildId: string): Promise<GuildSettings>;
   setGuildSettings(guildId: string, patch: Partial<Omit<GuildSettings, "guildId">>): Promise<void>;
+
+  /**
+   * Live-steering admin injection round (frodo, task 5) — the sole write
+   * path for `GuildSettings.liveContextOverride`/`liveContextOverrideExpiresAt`.
+   * Dedicated methods instead of routing through `setGuildSettings`'s generic
+   * patch (mirrors the existing `isOptedOut`/`setOptOut` and
+   * `hasAcceptedConsent`/`setConsentAccepted` per-field-method precedent
+   * above) for one concrete reason: `setGuildSettings`'s merge semantics are
+   * `patch.x ?? current?.x`, which has no way to express "clear this field"
+   * (passing `undefined` just means "leave it as whatever it already was") —
+   * and the brief explicitly wants this override "clearable". A dedicated
+   * `clearLiveContextOverride` sidesteps that ambiguity entirely instead of
+   * growing new null-vs-undefined patch semantics that would also apply to
+   * `voiceId`/`consentChannelId`.
+   *
+   * `ttlMs` optional — implementations compute
+   * `expiresAt = now + min(ttlMs ?? LIVE_CONTEXT_OVERRIDE_DEFAULT_TTL_MS, LIVE_CONTEXT_OVERRIDE_MAX_TTL_MS)`
+   * server-side (config/constants.ts) so the cap holds regardless of what a
+   * caller (Merry's future admin command/route) requests — an operator can
+   * ask for a shorter TTL, never a longer one than the hard max.
+   */
+  setLiveContextOverride(guildId: string, text: string, ttlMs?: number): Promise<void>;
+  clearLiveContextOverride(guildId: string): Promise<void>;
+
+  /**
+   * Guild-wide running jokes/lore round (frodo, task 4) — see
+   * `GuildMemorySchema`'s doc comment for why this is a separate row/table
+   * from `GuildSettings` despite the similar shape. `getGuildMemory` returns
+   * an empty-jokes row (not persisted) for a guild with no row yet, mirroring
+   * `getGuildSettings`'s "always returns something usable" contract.
+   */
+  getGuildMemory(guildId: string): Promise<GuildMemory>;
+  /** Dedupe + cap to `MAX_GUILD_RUNNING_JOKES`, same `dedupeAppend` semantics as `appendFacts`. No-op on an empty array. */
+  appendGuildRunningJokes(guildId: string, jokes: string[]): Promise<void>;
 
   appendConversationLog(entry: ConversationLogEntry): Promise<void>;
   /** Delete conversation_log rows older than the cutoff — retention/deletion policy, brief section 8. */

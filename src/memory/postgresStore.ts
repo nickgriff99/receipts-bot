@@ -1,12 +1,19 @@
 import { Pool, types } from "pg";
 import { newId } from "../shared/ids";
 import { logger } from "../shared/logger";
-import { MAX_FACTS_PER_PROFILE, MAX_ENGAGEMENT_OUTCOMES_PER_GUILD } from "../config/constants";
+import {
+  MAX_FACTS_PER_PROFILE,
+  MAX_ENGAGEMENT_OUTCOMES_PER_GUILD,
+  MAX_GUILD_RUNNING_JOKES,
+  LIVE_CONTEXT_OVERRIDE_DEFAULT_TTL_MS,
+  LIVE_CONTEXT_OVERRIDE_MAX_TTL_MS,
+} from "../config/constants";
 import { SCHEMA_SQL } from "./schema";
 import type {
   MemoryStore,
   UserMemoryProfile,
   GuildSettings,
+  GuildMemory,
   ConversationLogEntry,
   UsageLogEntry,
   UsageService,
@@ -54,6 +61,14 @@ interface GuildSettingsRow {
   voice_id: string | null;
   consent_channel_id: string | null;
   max_explicit_responses_per_minute: number | null;
+  live_context_override: string | null;
+  live_context_override_expires_at: number | null;
+  updated_at: number;
+}
+
+interface GuildMemoryRow {
+  guild_id: string;
+  running_jokes_json: unknown;
   updated_at: number;
 }
 
@@ -245,13 +260,22 @@ export class PostgresMemoryStore implements MemoryStore {
       voiceId: patch.voiceId ?? current?.voiceId,
       consentChannelId: patch.consentChannelId ?? current?.consentChannelId,
       maxExplicitResponsesPerMinute: patch.maxExplicitResponsesPerMinute ?? current?.maxExplicitResponsesPerMinute,
+      // Deliberately ignore patch.liveContextOverride/liveContextOverrideExpiresAt
+      // entirely (never `patch.x ?? current?.x` like every other optional
+      // override above) — these two fields have exactly one legitimate write
+      // path, `setLiveContextOverride`/`clearLiveContextOverride` below, which
+      // enforce the TTL cap. Letting the generic patch echo them through would
+      // let a caller set an uncapped/unpaired override by going around that
+      // logic. See GuildSettingsSchema's doc comment (memory/types.ts).
+      liveContextOverride: current?.liveContextOverride,
+      liveContextOverrideExpiresAt: current?.liveContextOverrideExpiresAt,
       updatedAt: Date.now(),
     };
 
     await this.pool.query(
       `INSERT INTO guild_settings
-        (guild_id, mode, max_responses_per_minute, min_gap_seconds, stt_confidence_threshold, allow_ambient_barge_in, voice_id, consent_channel_id, max_explicit_responses_per_minute, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        (guild_id, mode, max_responses_per_minute, min_gap_seconds, stt_confidence_threshold, allow_ambient_barge_in, voice_id, consent_channel_id, max_explicit_responses_per_minute, live_context_override, live_context_override_expires_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        ON CONFLICT (guild_id) DO UPDATE SET
          mode = excluded.mode,
          max_responses_per_minute = excluded.max_responses_per_minute,
@@ -261,6 +285,8 @@ export class PostgresMemoryStore implements MemoryStore {
          voice_id = excluded.voice_id,
          consent_channel_id = excluded.consent_channel_id,
          max_explicit_responses_per_minute = excluded.max_explicit_responses_per_minute,
+         live_context_override = excluded.live_context_override,
+         live_context_override_expires_at = excluded.live_context_override_expires_at,
          updated_at = excluded.updated_at`,
       [
         merged.guildId,
@@ -272,8 +298,62 @@ export class PostgresMemoryStore implements MemoryStore {
         merged.voiceId ?? null,
         merged.consentChannelId ?? null,
         merged.maxExplicitResponsesPerMinute ?? null,
+        merged.liveContextOverride ?? null,
+        merged.liveContextOverrideExpiresAt ?? null,
         merged.updatedAt,
       ],
+    );
+  }
+
+  /**
+   * See `MemoryStore.setLiveContextOverride`'s doc comment for why this is a
+   * dedicated method rather than routed through `setGuildSettings`. Ensures
+   * a row exists first (via `getGuildSettings`'s existing fallback-insert
+   * behavior), then updates only these two columns directly — never touches
+   * any other guild setting, so this can't race a concurrent admin-settings
+   * PATCH into clobbering unrelated fields.
+   */
+  async setLiveContextOverride(guildId: string, text: string, ttlMs?: number): Promise<void> {
+    await this.ready;
+    await this.getGuildSettings(guildId); // ensure a row exists
+    const cappedTtlMs = Math.min(ttlMs ?? LIVE_CONTEXT_OVERRIDE_DEFAULT_TTL_MS, LIVE_CONTEXT_OVERRIDE_MAX_TTL_MS);
+    const expiresAt = Date.now() + cappedTtlMs;
+    await this.pool.query(
+      `UPDATE guild_settings SET live_context_override = $1, live_context_override_expires_at = $2, updated_at = $3 WHERE guild_id = $4`,
+      [text, expiresAt, Date.now(), guildId],
+    );
+  }
+
+  async clearLiveContextOverride(guildId: string): Promise<void> {
+    await this.ready;
+    await this.getGuildSettings(guildId); // ensure a row exists
+    await this.pool.query(
+      `UPDATE guild_settings SET live_context_override = NULL, live_context_override_expires_at = NULL, updated_at = $1 WHERE guild_id = $2`,
+      [Date.now(), guildId],
+    );
+  }
+
+  async getGuildMemory(guildId: string): Promise<GuildMemory> {
+    await this.ready;
+    const result = await this.pool.query<GuildMemoryRow>(`SELECT * FROM guild_memory WHERE guild_id = $1`, [guildId]);
+    const row = result.rows[0];
+    if (row) return rowToGuildMemory(row);
+    return { guildId, runningJokes: [], updatedAt: Date.now() };
+  }
+
+  async appendGuildRunningJokes(guildId: string, jokes: string[]): Promise<void> {
+    if (jokes.length === 0) return;
+    await this.ready;
+    const existing = await this.getGuildMemory(guildId);
+    const merged = dedupeAppend(existing.runningJokes, jokes, MAX_GUILD_RUNNING_JOKES);
+    const now = Date.now();
+    await this.pool.query(
+      `INSERT INTO guild_memory (guild_id, running_jokes_json, updated_at)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (guild_id) DO UPDATE SET
+         running_jokes_json = excluded.running_jokes_json,
+         updated_at = excluded.updated_at`,
+      [guildId, JSON.stringify(merged), now],
     );
   }
 
@@ -325,7 +405,7 @@ export class PostgresMemoryStore implements MemoryStore {
       `SELECT service, SUM(units) as total FROM usage_log WHERE guild_id = $1 AND occurred_at >= $2 GROUP BY service`,
       [guildId, sinceTimestamp],
     );
-    const usage: Record<UsageService, number> = { stt: 0, llm: 0, tts: 0 };
+    const usage: Record<UsageService, number> = { stt: 0, llm: 0, tts: 0, web_search: 0 };
     for (const row of result.rows) usage[row.service] = Number(row.total);
     return usage;
   }
@@ -415,6 +495,16 @@ function rowToSettings(row: GuildSettingsRow): GuildSettings {
     voiceId: row.voice_id ?? undefined,
     consentChannelId: row.consent_channel_id ?? undefined,
     maxExplicitResponsesPerMinute: row.max_explicit_responses_per_minute ?? undefined,
+    liveContextOverride: row.live_context_override ?? undefined,
+    liveContextOverrideExpiresAt: row.live_context_override_expires_at ?? undefined,
+    updatedAt: row.updated_at,
+  };
+}
+
+function rowToGuildMemory(row: GuildMemoryRow): GuildMemory {
+  return {
+    guildId: row.guild_id,
+    runningJokes: parseJsonbArray(row.running_jokes_json),
     updatedAt: row.updated_at,
   };
 }
@@ -433,18 +523,20 @@ function parseJsonbArray(value: unknown): string[] {
 }
 
 /**
- * Dedupe + cap to the newest `MAX_FACTS_PER_PROFILE` entries. This is the
- * enforcement point for the JSON-column schema-lock decision (schema.ts):
- * since facts are stored as a whole-array JSON blob with no per-row
- * deletion, this truncation is what actually keeps the column bounded —
- * without it, "read/write whole list" storage would grow forever (brief
- * section 5's "periodic pruning" requirement). Ported verbatim from
- * `sqliteStore.ts`.
+ * Dedupe + cap to the newest `cap` entries. This is the enforcement point
+ * for the JSON-column schema-lock decision (schema.ts): since facts/jokes
+ * are stored as a whole-array JSON blob with no per-row deletion, this
+ * truncation is what actually keeps the column bounded — without it,
+ * "read/write whole list" storage would grow forever (brief section 5's
+ * "periodic pruning" requirement). Ported verbatim from `sqliteStore.ts`,
+ * generalized (guild-jokes round) to take an explicit `cap` instead of
+ * hardcoding `MAX_FACTS_PER_PROFILE` so `appendGuildRunningJokes` can reuse
+ * the same logic against `MAX_GUILD_RUNNING_JOKES` instead.
  */
-function dedupeAppend(existing: string[], additions: string[]): string[] {
+function dedupeAppend(existing: string[], additions: string[], cap: number = MAX_FACTS_PER_PROFILE): string[] {
   const set = new Set(existing);
   for (const fact of additions) set.add(fact);
   const merged = Array.from(set);
-  if (merged.length <= MAX_FACTS_PER_PROFILE) return merged;
-  return merged.slice(merged.length - MAX_FACTS_PER_PROFILE);
+  if (merged.length <= cap) return merged;
+  return merged.slice(merged.length - cap);
 }

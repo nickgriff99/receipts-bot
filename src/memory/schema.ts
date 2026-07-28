@@ -68,11 +68,21 @@ CREATE TABLE IF NOT EXISTS guild_settings (
   voice_id                   TEXT,
   consent_channel_id         TEXT,
   max_explicit_responses_per_minute INTEGER,
+  live_context_override                TEXT,
+  live_context_override_expires_at     BIGINT,
   updated_at                 BIGINT NOT NULL
 );
 
 -- Same live-DB-already-exists situation as user_profiles above.
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS consent_channel_id TEXT;
+
+-- Live-steering admin injection round (frodo, task 5) -- see memory/types.ts's
+-- GuildSettingsSchema doc comment on liveContextOverride/liveContextOverrideExpiresAt
+-- for why these two are written ONLY via PostgresMemoryStore#setLiveContextOverride/
+-- clearLiveContextOverride, never through the generic setGuildSettings patch.
+-- Same already-live-table ALTER situation as consent_channel_id above.
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS live_context_override TEXT;
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS live_context_override_expires_at BIGINT;
 
 -- Sam's contract-review follow-up (conversation-continuity round) --
 -- optional per-guild override for RateLimiterConfig.maxExplicitResponsesPerMinute
@@ -104,12 +114,26 @@ CREATE INDEX IF NOT EXISTS idx_conversation_log_guild_time ON conversation_log (
 CREATE TABLE IF NOT EXISTS usage_log (
   id           TEXT PRIMARY KEY,
   guild_id     TEXT NOT NULL,
-  service      TEXT NOT NULL CHECK (service IN ('stt', 'llm', 'tts')),
-  unit_type    TEXT NOT NULL CHECK (unit_type IN ('characters', 'tokens')),
+  service      TEXT NOT NULL CHECK (service IN ('stt', 'llm', 'tts', 'web_search')),
+  unit_type    TEXT NOT NULL CHECK (unit_type IN ('characters', 'tokens', 'searches')),
   units        BIGINT NOT NULL,
   occurred_at  BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_usage_log_guild_time ON usage_log (guild_id, occurred_at);
+
+-- Web-lookup round (frodo, task 3) -- Sam's contract-lock: 'web_search'/'searches'
+-- added to usage_log's CHECK constraints (see memory/types.ts's UsageServiceSchema/
+-- UsageUnitTypeSchema doc comments). Live DB already has usage_log from before these
+-- values existed -- CREATE TABLE IF NOT EXISTS above is a no-op against that existing
+-- table, and Postgres has no "ADD CHECK VALUE IF NOT EXISTS" shorthand, so the
+-- constraint has to be dropped and recreated. Names below are Postgres's default
+-- auto-generated names for an inline CHECK on CREATE TABLE (<table>_<column>_check) --
+-- matches what actually exists on a fresh-created table, same convention as every
+-- other already-live-table ALTER in this file.
+ALTER TABLE usage_log DROP CONSTRAINT IF EXISTS usage_log_service_check;
+ALTER TABLE usage_log ADD CONSTRAINT usage_log_service_check CHECK (service IN ('stt', 'llm', 'tts', 'web_search'));
+ALTER TABLE usage_log DROP CONSTRAINT IF EXISTS usage_log_unit_type_check;
+ALTER TABLE usage_log ADD CONSTRAINT usage_log_unit_type_check CHECK (unit_type IN ('characters', 'tokens', 'searches'));
 
 -- Adaptive-cadence learning signal (social-presence round, frodo's
 -- MemoryStore.recordTurnOutcome/getRecentEngagementStats -- see types.ts's
@@ -152,4 +176,17 @@ CREATE INDEX IF NOT EXISTS idx_turn_outcomes_guild_time ON turn_outcomes (guild_
 -- layer, so no live proactive row is mislabeled going forward).
 ALTER TABLE turn_outcomes ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'ambient' CHECK (category IN ('continuation', 'ambient', 'interjection', 'proactive'));
 CREATE INDEX IF NOT EXISTS idx_turn_outcomes_guild_category_time ON turn_outcomes (guild_id, category, occurred_at DESC);
+
+-- Guild-wide running jokes/lore (frodo, task 4) -- see memory/types.ts's
+-- GuildMemorySchema doc comment for why this is a separate table from
+-- guild_settings despite the identical JSON-blob-column shape (admin-mutable
+-- config vs. bot-learned collective memory are different concerns). One row
+-- per guild, same "read/write whole array" pattern + cap as
+-- user_profiles.running_jokes_json (MAX_GUILD_RUNNING_JOKES,
+-- config/constants.ts, enforced in postgresStore.ts#dedupeAppend).
+CREATE TABLE IF NOT EXISTS guild_memory (
+  guild_id            TEXT PRIMARY KEY,
+  running_jokes_json  JSONB NOT NULL DEFAULT '[]',
+  updated_at          BIGINT NOT NULL
+);
 `;
